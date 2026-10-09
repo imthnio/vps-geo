@@ -8,7 +8,7 @@
 #                    geooff         (back to this machine's own IP)
 
 # shellcheck disable=SC1007,SC1091,SC2015,SC2046,SC2154
-GEO_VERSION=2.0.0
+GEO_VERSION=2.1.0
 GLIDER_VERSION=0.16.4
 REPO_RAW=${GEO_REPO_RAW:-https://raw.githubusercontent.com/imthnio/vps-geo/main}
 # Prefix for GitHub downloads on machines that can't reach GitHub directly,
@@ -23,11 +23,19 @@ BIN=/usr/local/bin
 SELF=$BIN/geo
 GLIDER=$BIN/geo-glider
 PIDFILE=/var/run/geo.pid
+WATCH_PIDFILE=/var/run/geo-watch.pid
 LOG=/var/log/geo.log
 RUN_USER=geo
 REDIR_PORT=61080
 REDIR6_PORT=61081
 CHAIN=GEO_OUT
+UCHAIN=GEO_UDP
+# glider port that taken-over nodes send their traffic to (compat mode)
+COMPAT_PORT=61082
+NODE_TAG=geo-out
+# port mode picks its local port from this range by itself
+AUTO_PORT_MIN=1080
+AUTO_PORT_MAX=1199
 
 # ---------------------------------------------------------------- output
 
@@ -200,12 +208,41 @@ detect_system() {
   fi
 }
 
-# Whether the kernel lets us add NAT rules (needed for the whole-machine mode).
-nat_ok() {
-  have iptables || return 1
-  iptables -t nat -N GEO_TEST >/dev/null 2>&1 || return 1
-  iptables -t nat -X GEO_TEST >/dev/null 2>&1
-  return 0
+# Find an iptables that can do NAT here. Old kernels (OpenVZ 7 is 3.10)
+# have no nf_tables, so the default nft-based iptables fails there while
+# iptables-legacy works. Sets IPT and IP6T.
+pick_ipt() {
+  IPT= IP6T=
+  if have modprobe; then
+    modprobe -q iptable_nat 2>/dev/null
+    modprobe -q xt_REDIRECT 2>/dev/null
+  fi
+  for c in iptables iptables-legacy iptables-nft; do
+    have $c || continue
+    $c -t nat -N GEO_TEST >/dev/null 2>&1 || continue
+    if $c -t nat -A GEO_TEST -p tcp -j REDIRECT --to-ports 1 >/dev/null 2>&1; then
+      $c -t nat -F GEO_TEST >/dev/null 2>&1
+      $c -t nat -X GEO_TEST >/dev/null 2>&1
+      IPT=$c
+      IP6T=ip6${c#ip}
+      have "$IP6T" || IP6T=
+      return 0
+    fi
+    $c -t nat -F GEO_TEST >/dev/null 2>&1
+    $c -t nat -X GEO_TEST >/dev/null 2>&1
+  done
+  return 1
+}
+
+# The iptables chosen at activation (used again at boot).
+load_ipt() {
+  IPT=$(cat "$ETC/ipt" 2>/dev/null)
+  if [ -n "$IPT" ] && have "$IPT"; then
+    IP6T=ip6${IPT#ip}
+    have "$IP6T" || IP6T=
+    return 0
+  fi
+  pick_ipt
 }
 
 has_v6() {
@@ -273,13 +310,24 @@ ensure_base_deps() {
 }
 
 ensure_iptables() {
-  have iptables && return 0
-  say "整机模式需要 iptables，正在安装..."
-  pkg_install iptables >/dev/null 2>&1 || true
+  if ! have iptables && ! have iptables-legacy; then
+    say "整机模式需要 iptables，正在安装..."
+    pkg_install iptables >/dev/null 2>&1 || true
+  fi
   if [ "$PKG" = apt ] || [ "$PKG" = dnf ] || [ "$PKG" = yum ]; then
     have ip6tables || pkg_install ip6tables >/dev/null 2>&1 || true
   fi
-  have iptables
+  have iptables || have iptables-legacy
+}
+
+# Alpine ships the nft flavour by default; old 小鸡 kernels need legacy.
+ensure_iptables_legacy() {
+  have iptables-legacy && return 1
+  case $PKG in
+    apk) pkg_install iptables-legacy >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+  have iptables-legacy
 }
 
 glider_arch() {
@@ -561,42 +609,84 @@ port_in_use() {
     awk -v p="$hex" '$4 == "0A" && substr($2, length($2) - 4) == p {f=1} END {exit !f}'
 }
 
+# ---------------------------------------------------------------- state
+
+# off / nat (whole machine via iptables) / compat (whole machine via node
+# takeover, for boxes that can't do NAT) / port
+cur_state() {
+  _cs=$(active_name)
+  if [ -z "$_cs" ] || [ ! -f "$PROFILES/$_cs.conf" ]; then
+    echo off
+  elif [ "$(sed -n 's/^MODE=//p' "$PROFILES/$_cs.conf")" = port ]; then
+    echo port
+  elif [ "$(cat "$ETC/backend" 2>/dev/null)" = nat ]; then
+    echo nat
+  else
+    echo compat
+  fi
+}
+
 # ---------------------------------------------------------------- firewall (whole-machine mode)
 
+V4_PRIVATE="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
+V6_PRIVATE="::1/128 fc00::/7 fe80::/10 ff00::/8"
+
 fw_down() {
-  for t in iptables ip6tables; do
+  for t in iptables iptables-legacy iptables-nft ip6tables ip6tables-legacy ip6tables-nft; do
     have $t || continue
     while $t -t nat -D OUTPUT -p tcp -j $CHAIN >/dev/null 2>&1; do :; done
     $t -t nat -F $CHAIN >/dev/null 2>&1
     $t -t nat -X $CHAIN >/dev/null 2>&1
     while $t -D OUTPUT -p tcp -j $CHAIN >/dev/null 2>&1; do :; done
-    $t -F $CHAIN >/dev/null 2>&1
-    $t -X $CHAIN >/dev/null 2>&1
+    while $t -D OUTPUT -p udp -j $UCHAIN >/dev/null 2>&1; do :; done
+    for c in $CHAIN $UCHAIN; do
+      $t -F "$c" >/dev/null 2>&1
+      $t -X "$c" >/dev/null 2>&1
+    done
   done
+}
+
+# Refuse new outbound UDP (QUIC and the like) so it can't leave with this
+# machine's own IP; programs then fall back to TCP, which is proxied.
+# Replies to inbound UDP (hysteria2/tuic nodes) are not new and still pass.
+fw_udp() { # iptables-command private-nets...
+  _t=$1
+  shift
+  $_t -N $UCHAIN >/dev/null 2>&1 || return 1
+  for n in "$@"; do $_t -A $UCHAIN -d "$n" -j RETURN; done
+  $_t -A $UCHAIN -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1
+  [ "$owner" = 1 ] && $_t -A $UCHAIN -m owner --uid-owner "$RUN_USER" -j RETURN >/dev/null 2>&1
+  for p in 53 67 68 123 546 547; do $_t -A $UCHAIN -p udp --dport $p -j RETURN; done
+  if $_t -A $UCHAIN -p udp -m conntrack --ctstate NEW -j REJECT >/dev/null 2>&1 ||
+    $_t -A $UCHAIN -p udp -m state --state NEW -j REJECT >/dev/null 2>&1; then
+    $_t -A OUTPUT -p udp -j $UCHAIN >/dev/null 2>&1 && return 0
+  fi
+  $_t -F $UCHAIN >/dev/null 2>&1
+  $_t -X $UCHAIN >/dev/null 2>&1
+  return 1
 }
 
 # Send all locally started TCP connections to glider's redir listener,
 # except traffic to private ranges, to this machine, and glider's own
 # connections to the upstream proxy (matched by user and by address).
 fw_up() {
-  active=$(active_name)
-  [ -n "$active" ] && load_profile "$active" || return 1
-  [ "$MODE" = all ] || { fw_down; return 0; }
+  [ "$(cur_state)" = nat ] || { fw_down; return 0; }
+  load_profile "$(active_name)" || return 1
+  load_ipt || return 1
   fw_down
   ips=$(resolve_host "$(proxy_host "$PROXY")")
   owner=0
-  iptables -t nat -N $CHAIN || return 1
-  for n in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
-    172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-    iptables -t nat -A $CHAIN -d $n -j RETURN
+  $IPT -t nat -N $CHAIN || return 1
+  for n in $V4_PRIVATE; do
+    $IPT -t nat -A $CHAIN -d "$n" -j RETURN
   done
-  iptables -t nat -A $CHAIN -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1
+  $IPT -t nat -A $CHAIN -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1
   for ip in $ips; do
     case $ip in *:*) continue ;; esac
-    iptables -t nat -A $CHAIN -d "$ip" -j RETURN
+    $IPT -t nat -A $CHAIN -d "$ip" -j RETURN
   done
   if id "$RUN_USER" >/dev/null 2>&1 &&
-    iptables -t nat -A $CHAIN -m owner --uid-owner "$RUN_USER" -j RETURN >/dev/null 2>&1; then
+    $IPT -t nat -A $CHAIN -m owner --uid-owner "$RUN_USER" -j RETURN >/dev/null 2>&1; then
     owner=1
   fi
   if [ "$owner" = 0 ] && [ -z "$ips" ]; then
@@ -604,24 +694,26 @@ fw_up() {
     err "解析不到代理服务器地址，系统也不支持按用户排除流量，整机模式无法安全开启。"
     return 1
   fi
-  iptables -t nat -A $CHAIN -p tcp -j REDIRECT --to-ports $REDIR_PORT || { fw_down; return 1; }
-  iptables -t nat -A OUTPUT -p tcp -j $CHAIN || { fw_down; return 1; }
+  $IPT -t nat -A $CHAIN -p tcp -j REDIRECT --to-ports $REDIR_PORT || { fw_down; return 1; }
+  $IPT -t nat -A OUTPUT -p tcp -j $CHAIN || { fw_down; return 1; }
+  # shellcheck disable=SC2086
+  fw_udp "$IPT" $V4_PRIVATE || warn "这台机器没法拦截 UDP，节点的 UDP 流量（如 QUIC）可能用本机 IP 出去。"
 
   # IPv6: proxy it if the kernel allows, otherwise refuse it so programs
   # fall back to IPv4 instead of leaking the real address.
-  if has_v6 && have ip6tables; then
-    if [ "$(cat $ETC/v6 2>/dev/null)" = redir ] && ip6tables -t nat -N $CHAIN >/dev/null 2>&1; then
-      t="ip6tables -t nat"
+  if has_v6 && [ -n "$IP6T" ]; then
+    if [ "$(cat $ETC/v6 2>/dev/null)" = redir ] && $IP6T -t nat -N $CHAIN >/dev/null 2>&1; then
+      t="$IP6T -t nat"
       last="-j REDIRECT --to-ports $REDIR6_PORT"
-    elif ip6tables -N $CHAIN >/dev/null 2>&1; then
-      t=ip6tables
+    elif $IP6T -N $CHAIN >/dev/null 2>&1; then
+      t=$IP6T
       last="-j REJECT --reject-with tcp-reset"
     else
       warn "无法接管 IPv6，访问 IPv6 网站时会露出本机 IP。"
       return 0
     fi
-    for n in ::1/128 fc00::/7 fe80::/10 ff00::/8; do
-      $t -A $CHAIN -d $n -j RETURN
+    for n in $V6_PRIVATE; do
+      $t -A $CHAIN -d "$n" -j RETURN
     done
     $t -A $CHAIN -m addrtype --dst-type LOCAL -j RETURN >/dev/null 2>&1
     for ip in $ips; do
@@ -631,6 +723,8 @@ fw_up() {
     # shellcheck disable=SC2086
     $t -A $CHAIN -p tcp $last >/dev/null 2>&1 && $t -A OUTPUT -p tcp -j $CHAIN >/dev/null 2>&1 ||
       warn "IPv6 规则设置失败，访问 IPv6 网站时会露出本机 IP。"
+    # shellcheck disable=SC2086
+    fw_udp "$IP6T" $V6_PRIVATE >/dev/null 2>&1
   fi
   return 0
 }
@@ -638,27 +732,206 @@ fw_up() {
 # Decide once per activation whether IPv6 gets redirected (needs ip6tables nat).
 probe_v6() {
   v6=none
-  if has_v6 && have ip6tables && ip6tables -t nat -N GEO_TEST >/dev/null 2>&1; then
-    ip6tables -t nat -X GEO_TEST >/dev/null 2>&1
+  if has_v6 && [ -n "$IP6T" ] && $IP6T -t nat -N GEO_TEST >/dev/null 2>&1; then
+    $IP6T -t nat -X GEO_TEST >/dev/null 2>&1
     v6=redir
   fi
   echo $v6 >$ETC/v6
 }
 
+# ---------------------------------------------------------------- node takeover (compat mode)
+#
+# When the box can't redirect traffic (no NAT in many OpenVZ/LXC guests),
+# point the proxy nodes' own outbound at glider instead. glider keeps
+# listening on COMPAT_PORT, so switching exits never touches node configs.
+
+NODE_CONFS="/etc/sing-box/config.json /usr/local/etc/sing-box/config.json
+/etc/xray/config.json /usr/local/etc/xray/config.json
+/etc/v2ray/config.json /usr/local/etc/v2ray/config.json
+/etc/hysteria/config.yaml /etc/hysteria/config.yml"
+
+node_kind() {
+  case $1 in
+    *sing-box*) echo sing-box ;;
+    *xray*) echo xray ;;
+    *v2ray*) echo v2ray ;;
+    *hysteria*) echo hysteria ;;
+  esac
+}
+
+ensure_jq() {
+  have jq && return 0
+  pkg_install jq >/dev/null 2>&1
+  have jq
+}
+
+node_bin() { # name
+  for _b in "$(command -v "$1" 2>/dev/null)" /usr/local/bin/"$1" /usr/bin/"$1" /etc/"$1"/"$1"; do
+    [ -n "$_b" ] && [ -x "$_b" ] && { echo "$_b"; return 0; }
+  done
+  return 1
+}
+
+node_test() { # kind file
+  case $1 in
+    sing-box) _b=$(node_bin sing-box) || return 0; "$_b" check -c "$2" >/dev/null 2>&1 ;;
+    xray) _b=$(node_bin xray) || return 0
+      "$_b" run -test -c "$2" >/dev/null 2>&1 || "$_b" -test -config "$2" >/dev/null 2>&1 ;;
+    *) return 0 ;;
+  esac
+}
+
+node_restart() { # kind
+  case $1 in
+    sing-box) _svcs="sing-box sb singbox" ;;
+    xray) _svcs=xray ;;
+    v2ray) _svcs=v2ray ;;
+    hysteria) _svcs="hysteria-server hysteria hysteria2 hy2" ;;
+  esac
+  for _s in $_svcs; do
+    case $INIT in
+      systemd)
+        systemctl cat "$_s" >/dev/null 2>&1 || continue
+        systemctl restart "$_s" && return 0 ;;
+      openrc)
+        [ -f "/etc/init.d/$_s" ] || continue
+        rc-service "$_s" restart >/dev/null 2>&1 && return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Configs that failed once are skipped until their content changes.
+node_skipped() { # file
+  _sk=$ETC/skip/$(printf '%s' "$1" | tr / _)
+  [ -f "$_sk" ] && [ "$(cat "$_sk")" = "$(cksum <"$1")" ]
+}
+
+node_skip() { # file reason
+  mkdir -p "$ETC/skip"
+  cksum <"$1" >"$ETC/skip/$(printf '%s' "$1" | tr / _)"
+  warn "没法自动接管 $1：$2"
+}
+
+node_inject() { # file
+  _f=$1
+  _k=$(node_kind "$_f")
+  grep -q "$NODE_TAG" "$_f" 2>/dev/null && return 0
+  node_skipped "$_f" && return 1
+  mkdir -p "$ETC/backup"
+  cp "$_f" "$ETC/backup/$(printf '%s' "$_f" | tr / _)"
+  case $_k in
+    hysteria)
+      if grep -q '^outbounds:' "$_f"; then
+        node_skip "$_f" "配置里已经有 outbounds，请手动添加 socks5 出站 127.0.0.1:$COMPAT_PORT"
+        return 1
+      fi
+      printf '\n# %s: added by vps-geo\noutbounds:\n  - name: %s\n    type: socks5\n    socks5:\n      addr: 127.0.0.1:%s\n' \
+        "$NODE_TAG" "$NODE_TAG" "$COMPAT_PORT" >>"$_f"
+      ;;
+    sing-box|xray|v2ray)
+      ensure_jq || { node_skip "$_f" "装不上 jq"; return 1; }
+      if [ "$_k" = sing-box ]; then
+        # Remember the original default outbound so uninstall can restore it.
+        jq -r '.route.final // empty' "$_f" >"$ETC/backup/$(printf '%s' "$_f" | tr / _).final" 2>/dev/null
+        jq --arg t "$NODE_TAG" --argjson p "$COMPAT_PORT" '
+          .outbounds = ([{type: "socks", tag: $t, server: "127.0.0.1", server_port: $p, version: "5"}] + (.outbounds // []))
+          | if .route.final then .route.final = $t else . end' "$_f" >"$_f.geo" 2>/dev/null
+      else
+        jq --arg t "$NODE_TAG" --argjson p "$COMPAT_PORT" '
+          .outbounds = ([{tag: $t, protocol: "socks", settings: {servers: [{address: "127.0.0.1", port: $p}]}}] + (.outbounds // []))' \
+          "$_f" >"$_f.geo" 2>/dev/null
+      fi
+      _jq=$?
+      if [ "$_jq" -ne 0 ] || [ ! -s "$_f.geo" ]; then
+        rm -f "$_f.geo"
+        node_skip "$_f" "配置文件不是标准 JSON（可能带注释）"
+        return 1
+      fi
+      # Write in place so the file keeps its owner and permissions.
+      cat "$_f.geo" >"$_f"
+      rm -f "$_f.geo"
+      ;;
+    *) return 1 ;;
+  esac
+  if ! node_test "$_k" "$_f"; then
+    cat "$ETC/backup/$(printf '%s' "$_f" | tr / _)" >"$_f"
+    node_skip "$_f" "改完后 $_k 自检不通过，已还原"
+    return 1
+  fi
+  if node_restart "$_k"; then
+    ok "已接管 $_k 节点（$_f），它的出口会跟着 geo 切换。"
+  else
+    ok "已接管 $_k 节点（$_f）。没找到它的服务，请手动重启一次 $_k。"
+  fi
+  return 0
+}
+
+node_release() { # file
+  _f=$1
+  _k=$(node_kind "$_f")
+  grep -q "$NODE_TAG" "$_f" 2>/dev/null || return 0
+  case $_k in
+    hysteria)
+      # Drop our appended block and the blank line in front of it.
+      awk -v m="# $NODE_TAG: added by vps-geo" '$0 == m {exit}
+        $0 == "" {b = b "\n"; next} {printf "%s", b; b = ""; print}' "$_f" >"$_f.geo" &&
+        [ -s "$_f.geo" ] && cat "$_f.geo" >"$_f"
+      rm -f "$_f.geo"
+      ;;
+    *)
+      ensure_jq || return 1
+      _fin=$(cat "$ETC/backup/$(printf '%s' "$_f" | tr / _).final" 2>/dev/null)
+      jq --arg t "$NODE_TAG" --arg fin "$_fin" '(.outbounds |= map(select(.tag != $t)))
+        | if .route.final == $t then
+            (if $fin == "" then del(.route.final) else .route.final = $fin end)
+          else . end' "$_f" >"$_f.geo" 2>/dev/null &&
+        [ -s "$_f.geo" ] && cat "$_f.geo" >"$_f"
+      rm -f "$_f.geo"
+      ;;
+  esac
+  node_restart "$_k"
+  say "已把 $_k 节点恢复成直连出站（$_f）。"
+}
+
+# Inject into every node config found; NODES_TAKEN lists the ones in use.
+node_scan() {
+  NODES_TAKEN=
+  mkdir "$ETC/.lock" 2>/dev/null || return 0
+  for _nf in $NODE_CONFS; do
+    [ -f "$_nf" ] || continue
+    node_inject "$_nf" && NODES_TAKEN="$NODES_TAKEN $(node_kind "$_nf")"
+  done
+  rmdir "$ETC/.lock" 2>/dev/null
+}
+
+# Runs as a service in compat mode, so nodes installed later are taken over too.
+node_watch() {
+  rmdir "$ETC/.lock" 2>/dev/null
+  while :; do
+    [ -f "$ETC/compat" ] && node_scan >/dev/null 2>&1
+    sleep 20
+  done
+}
+
 # ---------------------------------------------------------------- service
 
 write_glider_conf() {
+  _wa=$(active_name)
+  PROXY= MODE= PORT=
+  [ -n "$_wa" ] && load_profile "$_wa"
+  _st=$(cur_state)
   umask 077
   {
-    echo "forward=$PROXY"
+    [ -n "$PROXY" ] && echo "forward=$PROXY"
     echo "check=disable"
     echo "dialtimeout=10"
-    if [ "$MODE" = all ]; then
+    if [ "$_st" = nat ]; then
       echo "listen=redir://127.0.0.1:$REDIR_PORT"
       [ "$(cat $ETC/v6 2>/dev/null)" = redir ] && echo "listen=redir6://[::1]:$REDIR6_PORT"
-    else
-      echo "listen=mixed://127.0.0.1:$PORT"
     fi
+    [ "$_st" = port ] && echo "listen=mixed://127.0.0.1:$PORT"
+    [ -f "$ETC/compat" ] && echo "listen=mixed://127.0.0.1:$COMPAT_PORT"
   } >"$GLIDER_CONF"
   id "$RUN_USER" >/dev/null 2>&1 && chown "$RUN_USER" "$GLIDER_CONF" 2>/dev/null
   chmod 600 "$GLIDER_CONF"
@@ -710,6 +983,20 @@ ExecStop=$SELF fw-down
 [Install]
 WantedBy=multi-user.target
 EOF
+      cat >/etc/systemd/system/geo-watch.service <<EOF
+[Unit]
+Description=vps-geo node takeover
+After=network-online.target geo.service
+
+[Service]
+Type=simple
+ExecStart=$SELF watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
       systemctl daemon-reload
       ;;
     openrc)
@@ -745,7 +1032,22 @@ stop_post() {
   $SELF fw-down
 }
 EOF
-      chmod 755 /etc/init.d/geo
+      cat >/etc/init.d/geo-watch <<EOF
+#!/sbin/openrc-run
+description="vps-geo node takeover"
+supervisor=supervise-daemon
+command="$SELF"
+command_args="watch"
+output_log="$LOG"
+error_log="$LOG"
+respawn_delay=5
+
+depend() {
+  use net
+  after geo
+}
+EOF
+      chmod 755 /etc/init.d/geo /etc/init.d/geo-watch
       ;;
   esac
 }
@@ -758,59 +1060,69 @@ svc_running() {
   esac
 }
 
-svc_start() {
+# systemd/openrc helpers: svc_on NAME / svc_off NAME
+svc_on() {
   case $INIT in
-    systemd)
-      systemctl enable geo >/dev/null 2>&1
-      systemctl restart geo || return 1
-      if [ "$MODE" = all ]; then
-        systemctl enable geo-fw >/dev/null 2>&1
-        systemctl restart geo-fw || return 1
+    systemd) systemctl enable "$1" >/dev/null 2>&1; systemctl restart "$1" ;;
+    openrc) rc-update add "$1" default >/dev/null 2>&1
+      rc-service "$1" restart >/dev/null 2>&1 || rc-service "$1" start >/dev/null 2>&1 ;;
+  esac
+}
+
+svc_off() {
+  case $INIT in
+    systemd) systemctl stop "$1" >/dev/null 2>&1; systemctl disable "$1" >/dev/null 2>&1 ;;
+    openrc) rc-service "$1" stop >/dev/null 2>&1; rc-update del "$1" default >/dev/null 2>&1 ;;
+  esac
+  return 0
+}
+
+svc_stop_all() {
+  for s in geo-watch geo-fw geo; do svc_off $s; done
+  raw_stop
+  fw_down
+}
+
+# Make the running services match the active exit (or "off").
+apply_state() {
+  _st=$(cur_state)
+  if [ "$_st" = off ] && [ ! -f "$ETC/compat" ]; then
+    svc_stop_all
+    return 0
+  fi
+  fw_down
+  write_glider_conf
+  install_service
+  case $INIT in
+    systemd|openrc)
+      svc_on geo || return 1
+      if [ "$_st" = nat ]; then
+        [ "$INIT" = systemd ] && { svc_on geo-fw || return 1; }
       else
-        systemctl disable geo-fw >/dev/null 2>&1
-        systemctl stop geo-fw >/dev/null 2>&1
+        [ "$INIT" = systemd ] && svc_off geo-fw
       fi
-      ;;
-    openrc)
-      rc-update add geo default >/dev/null 2>&1
-      rc-service geo restart >/dev/null 2>&1 || rc-service geo start >/dev/null 2>&1 || return 1
+      if [ -f "$ETC/compat" ]; then svc_on geo-watch; else svc_off geo-watch; fi
       ;;
     *)
       raw_stop
       raw_start || return 1
-      fw_up || return 1
+      if [ "$_st" = nat ]; then fw_up || return 1; fi
       autostart_none
       ;;
+  esac
+  case $_st in
+    nat) _wp=$REDIR_PORT ;;
+    port) _wp=$(sed -n 's/^PORT=//p' "$PROFILES/$(active_name).conf") ;;
+    *) _wp=$COMPAT_PORT ;;
   esac
   # Give glider a moment to bind.
   i=0
   while [ $i -lt 10 ]; do
-    if [ "$MODE" = all ]; then port_in_use $REDIR_PORT && return 0
-    else port_in_use "$PORT" && return 0
-    fi
+    port_in_use "$_wp" && return 0
     sleep 1
     i=$((i + 1))
   done
   return 1
-}
-
-svc_stop() {
-  case $INIT in
-    systemd)
-      systemctl stop geo-fw >/dev/null 2>&1
-      systemctl disable geo-fw >/dev/null 2>&1
-      systemctl stop geo >/dev/null 2>&1
-      systemctl disable geo >/dev/null 2>&1
-      ;;
-    openrc)
-      rc-service geo stop >/dev/null 2>&1
-      rc-update del geo default >/dev/null 2>&1
-      ;;
-    *)
-      raw_stop
-      ;;
-  esac
-  fw_down
 }
 
 # No init system (some containers): run glider in the background ourselves.
@@ -825,14 +1137,22 @@ raw_start() {
     env $(go_env) "$GLIDER" -config "$GLIDER_CONF" </dev/null >>"$LOG" 2>&1 &
   fi
   echo $! >"$PIDFILE"
+  if [ -f "$ETC/compat" ]; then
+    nohup "$SELF" watch </dev/null >>"$LOG" 2>&1 &
+    echo $! >"$WATCH_PIDFILE"
+  fi
 }
 
 raw_stop() {
-  if [ -f "$PIDFILE" ]; then
-    kill "$(cat "$PIDFILE")" 2>/dev/null
-    rm -f "$PIDFILE"
+  for pf in "$PIDFILE" "$WATCH_PIDFILE"; do
+    [ -f "$pf" ] || continue
+    kill "$(cat "$pf")" 2>/dev/null
+    rm -f "$pf"
+  done
+  if have pkill; then
+    pkill -f "$GLIDER -config" 2>/dev/null
+    pkill -f "$SELF watch" 2>/dev/null
   fi
-  if have pkill; then pkill -f "$GLIDER -config" 2>/dev/null; fi
   return 0
 }
 
@@ -848,39 +1168,108 @@ need_root() {
   [ "$(id -u)" = 0 ] || die "请用 root 运行（先执行 sudo -i 或 su -）。"
 }
 
+# A free port for port mode, picked automatically so it never takes a port
+# the user wants for a node. The active exit's own port counts as free.
+pick_port() {
+  _pa=$(active_name)
+  _pc=
+  [ -n "$_pa" ] && [ -f "$PROFILES/$_pa.conf" ] && _pc=$(sed -n 's/^PORT=//p' "$PROFILES/$_pa.conf")
+  _pp=$AUTO_PORT_MIN
+  while [ "$_pp" -le "$AUTO_PORT_MAX" ]; do
+    if [ "$_pp" = "$_pc" ] || ! port_in_use "$_pp"; then
+      echo "$_pp"
+      return 0
+    fi
+    _pp=$((_pp + 1))
+  done
+  echo "$AUTO_PORT_MAX"
+}
+
+save_real_ip() {
+  [ -n "$IP_ADDR" ] && echo "$IP_ADDR" >"$ETC/real_ip"
+}
+
+real_ip() {
+  cat "$ETC/real_ip" 2>/dev/null
+}
+
+# Fix up exits saved by older versions. Sets MIGRATED to an exit that was
+# switched to while doing so.
+migrate_profiles() {
+  MIGRATED=
+  # 2.0.0 had no backend file; its whole-machine mode was always NAT.
+  if [ ! -f "$ETC/backend" ] && [ "$(cur_state)" = compat ]; then
+    echo nat >"$ETC/backend"
+  fi
+  for _mp in $(list_profiles); do
+    load_profile "$_mp" || continue
+    [ "$MODE" = port ] || continue
+    if [ "$PORT" -ge "$AUTO_PORT_MIN" ] && [ "$PORT" -le "$AUTO_PORT_MAX" ]; then continue; fi
+    _old=$PORT
+    _proxy=$PROXY
+    title "升级提示"
+    warn "出口 $_mp 之前占用了端口 $_old，搭节点时这个端口会显示「已被占用」。"
+    say "新版不再让你填端口，下面帮你改好。"
+    if confirm "你是想让节点（xray / sing-box 等）的出口变成这个 IP 吗？选 Y 改成整机模式（推荐）" y; then
+      save_profile "$_mp" "$_proxy" all 0
+    else
+      _np=$(pick_port)
+      save_profile "$_mp" "$_proxy" port "$_np"
+      say "已把 $_mp 的本机代理端口改成 $_np。"
+    fi
+    if [ "$(active_name)" = "$_mp" ]; then
+      use_profile "$_mp"
+      MIGRATED=$_mp
+    fi
+    ok "端口 $_old 已经空出来，搭节点时可以用了。"
+  done
+}
+
 # use_profile NAME
 use_profile() {
   load_profile "$1" || die "没有名为 $1 的出口。输入 geo 打开菜单查看。"
+  _un=$NAME
   prev=$(active_name)
+  # Remember this machine's own IP while its traffic still goes out directly.
+  if [ "$(cur_state)" != nat ] && check_ip; then save_real_ip; fi
+  load_profile "$_un"
+
   if [ "$MODE" = all ]; then
-    ensure_iptables || die "装不上 iptables，整机模式用不了。可以用 geo 菜单把它改成端口模式。"
-    nat_ok || die "这台小鸡不允许改 NAT 规则（常见于 OpenVZ/LXC），整机模式用不了。可以用 geo 菜单把它改成端口模式。"
-    probe_v6
+    backend=compat
+    if ensure_iptables && { pick_ipt || { ensure_iptables_legacy && pick_ipt; }; }; then
+      backend=nat
+      echo "$IPT" >"$ETC/ipt"
+      probe_v6
+    elif [ ! -f "$ETC/compat" ]; then
+      say "这台小鸡不允许改网络规则（OpenVZ / LXC 常见），已自动改用${C_G}节点接管${C_0}方式："
+      say "xray / sing-box / hysteria2 节点的流量会走这个出口。"
+      say "节点装在 geo 之后也没关系，装好后 20 秒内会自动接管。"
+    fi
+    [ "$backend" = compat ] && touch "$ETC/compat"
+    echo "$backend" >"$ETC/backend"
   fi
+
   say "正在切换到 $C_G$NAME$C_0（$(mode_text "$MODE" "$PORT")）..."
-  # The port listener and the firewall are replaced together.
-  svc_stop
-  write_glider_conf
   echo "$NAME" >"$ACTIVE"
-  install_service
-  if ! svc_start; then
-    svc_stop
+  if ! apply_state; then
     rm -f "$ACTIVE"
+    apply_state
     err "代理程序没有起来。日志: $( [ "$INIT" = systemd ] && echo 'journalctl -u geo' || echo "$LOG" )"
     say "已恢复本机直连。"
     return 1
   fi
-  if [ "$MODE" = all ]; then
-    check_ip
-  else
-    check_ip -x "socks5h://127.0.0.1:$PORT"
-  fi
+  _st=$(cur_state)
+  case $_st in
+    nat) check_ip ;;
+    port) check_ip -x "socks5h://127.0.0.1:$PORT" ;;
+    *) check_ip -x "socks5h://127.0.0.1:$COMPAT_PORT" ;;
+  esac
   rc=$?
   if [ $rc -ne 0 ]; then
     err "通过这个出口访问外网失败，代理可能不通或账号密码不对。"
-    if [ "$MODE" = all ]; then
-      svc_stop
+    if [ "$_st" = nat ]; then
       rm -f "$ACTIVE"
+      apply_state
       say "为了不让整台机器断网，已自动恢复本机直连。"
       [ -n "$prev" ] && [ "$prev" != "$NAME" ] && say "（之前用的是 $prev，需要的话输入 $prev 切回去）"
     fi
@@ -888,43 +1277,84 @@ use_profile() {
   fi
   ok "已切换到 $NAME"
   print_ip
-  if [ "$MODE" = port ]; then
-    say ""
-    say "  本机代理端口（SOCKS5 和 HTTP 都可以）:"
-    say "    socks5://127.0.0.1:$PORT"
-    say "    http://127.0.0.1:$PORT"
-    say "  节点（xray / sing-box 等）把出站指向它即可；测试: curl -x socks5h://127.0.0.1:$PORT ipinfo.io"
-  fi
+  _real=$(real_ip)
+  case $_st in
+    nat)
+      say ""
+      say "  这台机器访问外网都会用上面的出口 IP，节点也一样，不用改节点配置。"
+      if [ -n "$_real" ]; then
+        say "  ${C_Y}搭节点注意${C_0}：节点地址要填本机 IP ${C_G}$_real${C_0}，不是上面的出口 IP。"
+        say "  搭节点脚本自动检测到的 IP 如果不是 $_real，请手动改成 $_real。"
+      fi
+      ;;
+    compat)
+      node_scan
+      say ""
+      if [ -n "$NODES_TAKEN" ]; then
+        say "  已接管的节点:$NODES_TAKEN。节点的出口就是上面的 IP。"
+      else
+        say "  还没发现节点。现在去搭节点就行，装好后 20 秒内自动接管，不用再做别的。"
+      fi
+      say "  支持 xray、sing-box、hysteria2（用一键脚本装的一般都行）。"
+      [ -n "$_real" ] && say "  节点地址填本机 IP: ${C_G}$_real${C_0}"
+      ;;
+    port)
+      say ""
+      say "  已自动开好本机代理端口（SOCKS5 和 HTTP 都可以）:"
+      say "    socks5://127.0.0.1:$PORT"
+      say "    http://127.0.0.1:$PORT"
+      say "  这是给程序用的内部端口，${C_Y}搭节点时不要填它${C_0}。"
+      say "  测试: curl -x socks5h://127.0.0.1:$PORT ipinfo.io"
+      ;;
+  esac
   return 0
 }
 
 turn_off() {
-  svc_stop
   rm -f "$ACTIVE"
-  ok "已关闭，恢复本机直连。"
-  check_ip && print_ip
+  apply_state
+  if [ -f "$ETC/compat" ]; then
+    ok "已关闭，节点和本机都恢复直连。"
+  else
+    ok "已关闭，恢复本机直连。"
+  fi
+  check_ip && print_ip && save_real_ip
   return 0
 }
 
 show_status() {
   title "当前状态"
+  _real=$(real_ip)
+  [ -n "$_real" ] && say "本机 IP（搭节点填这个）: $_real"
   a=$(active_name)
   if [ -z "$a" ] || ! load_profile "$a"; then
-    say "当前: 直连（没有使用任何出口）"
+    say "当前出口: 直连（没有使用任何出口）"
     check_ip && print_ip || warn "查不到本机出口 IP。"
     return 0
   fi
-  say "当前出口: $C_G$a$C_0（$(mode_text "$MODE" "$PORT")）"
+  _st=$(cur_state)
+  case $_st in
+    nat) _how="整机" ;;
+    compat) _how="整机（节点接管）" ;;
+    *) _how="端口 127.0.0.1:$PORT" ;;
+  esac
+  say "当前出口: $C_G$a$C_0（$_how）"
+  if [ "$_st" = compat ]; then
+    _nodes=
+    for _nf in $NODE_CONFS; do
+      grep -qs "$NODE_TAG" "$_nf" && _nodes="$_nodes $(node_kind "$_nf")"
+    done
+    say "已接管节点: ${_nodes:- 还没有（装好节点后 20 秒内自动接管）}"
+  fi
   if ! svc_running; then
     warn "代理程序没在运行，输入 $a 重新启动它。"
     return 0
   fi
-  if [ "$MODE" = all ]; then check_ip; else check_ip -x "socks5h://127.0.0.1:$PORT"; fi &&
-    print_ip || warn "通过这个出口查不到 IP，代理可能断了。"
-  if [ "$MODE" = port ]; then
-    say "本机直连出口（端口模式下其它流量不变）:"
-    check_ip && print_ip
-  fi
+  case $_st in
+    nat) check_ip ;;
+    port) check_ip -x "socks5h://127.0.0.1:$PORT" ;;
+    *) check_ip -x "socks5h://127.0.0.1:$COMPAT_PORT" ;;
+  esac && print_ip || warn "通过这个出口查不到 IP，代理可能断了。"
   return 0
 }
 
@@ -996,69 +1426,25 @@ add_profile() {
     break
   done
 
-  title "第 3 步：出口 IP 作用范围"
-  # yes / no / unknown (iptables not installed yet)
-  nat=unknown
-  if have iptables; then
-    if nat_ok; then nat=yes; else nat=no; fi
-  fi
-  natnote=
-  if [ "$nat" = no ]; then
-    natnote="（这台机器不允许改 NAT 规则，用不了）"
-  elif [ "$VIRT_KIND" = container ]; then
-    natnote="（$VIRT 容器有时不支持，选了会自动检测）"
-  fi
-  say "  1) 整机：这台机器发出去的所有 TCP 连接都走这个出口$natnote"
-  say "  2) 端口：在本机开一个代理端口，只有指向这个端口的程序/节点才走这个出口，其它流量不变"
+  title "第 3 步：出口 IP 用在哪里"
+  say "  1) 整机（推荐，搭节点就选这个）：节点和这台机器访问外网都用这个出口 IP"
+  say "  2) 只开一个本机代理端口：给会自己改配置的人用，其它流量不变"
   if [ "$ROLE" = 母鸡 ]; then
     say "  提示：这是母鸡。整机模式只影响母鸡自己发起的连接，不影响下面的小鸡。"
   fi
-  defmode=1
-  [ "$nat" = no ] && defmode=2
+  say "  不确定就直接回车。小鸡不支持改网络规则时，脚本会自动换成别的办法，不用你管。"
   while :; do
-    ask in_mode "请选择 1 或 2" "$defmode"
+    ask in_mode "请选择 1 或 2" 1
     case $in_mode in
-      1|整机)
-        if ensure_iptables && nat_ok; then
-          mode=all
-          port=0
-          break
-        fi
-        err "这台机器不支持整机模式（没有 iptables 或不允许改 NAT，OpenVZ/LXC 小鸡常见）。"
-        say "已自动改用端口模式。"
-        mode=port
-        break
-        ;;
-      2|端口) mode=port; break ;;
+      1|整机) mode=all; port=0; break ;;
+      2|端口) mode=port; port=$(pick_port); break ;;
       *) err "请输入 1 或 2。"; [ -n "${GEO_ASK_in_mode:-}" ] && exit 1 ;;
     esac
   done
-  if [ "$mode" = port ]; then
-    cur=$(active_name)
-    curport=
-    if [ -n "$cur" ] && load_profile "$cur" && [ "$MODE" = port ]; then curport=$PORT; fi
-    defport=1080
-    while port_in_use $defport && [ "$defport" != "$curport" ]; do defport=$((defport + 1)); done
-    while :; do
-      ask in_port "本机代理端口（1025-65535）" "$defport"
-      case $in_port in ''|*[!0-9]*) err "请输入数字。"; continue ;; esac
-      if [ "$in_port" -lt 1025 ] || [ "$in_port" -gt 65535 ] || [ "$in_port" = $REDIR_PORT ] || [ "$in_port" = $REDIR6_PORT ]; then
-        err "端口要在 1025-65535 之间（$REDIR_PORT、$REDIR6_PORT 被脚本占用）。"
-        [ -n "${GEO_ASK_in_port:-}" ] && exit 1
-        continue
-      fi
-      if port_in_use "$in_port" && [ "$in_port" != "$curport" ]; then
-        err "端口 $in_port 已经被别的程序占用了，换一个吧。"
-        [ -n "${GEO_ASK_in_port:-}" ] && exit 1
-        continue
-      fi
-      port=$in_port
-      break
-    done
-  fi
 
   save_profile "$in_name" "$proxy" "$mode" "$port"
   ok "已保存出口 $in_name（$(mode_text "$mode" "$port")）"
+  [ "$mode" = port ] && say "本机代理端口已自动选好: $port（这是内部端口，搭节点时不要填它）"
   if confirm "现在就切换到 $in_name 吗？" y; then
     use_profile "$in_name"
   fi
@@ -1097,14 +1483,19 @@ del_profile() { # name
 }
 
 uninstall() {
-  svc_stop
-  rm -f /etc/systemd/system/geo.service /etc/systemd/system/geo-fw.service /etc/init.d/geo
+  for f in $NODE_CONFS; do
+    [ -f "$f" ] && node_release "$f"
+  done
+  rm -f "$ACTIVE" "$ETC/compat"
+  svc_stop_all
+  rm -f /etc/systemd/system/geo.service /etc/systemd/system/geo-fw.service \
+    /etc/systemd/system/geo-watch.service /etc/init.d/geo /etc/init.d/geo-watch
   [ "$INIT" = systemd ] && systemctl daemon-reload
   if have crontab; then
     crontab -l 2>/dev/null | grep -v "$SELF boot" | crontab - 2>/dev/null
   fi
   for p in $(list_profiles); do rm -f "$BIN/$p"; done
-  rm -f "$BIN/geooff" "$GLIDER" "$LOG" "$PIDFILE"
+  rm -f "$BIN/geooff" "$GLIDER" "$LOG" "$PIDFILE" "$WATCH_PIDFILE"
   rm -rf "$ETC"
   if id "$RUN_USER" >/dev/null 2>&1; then
     if have userdel; then userdel "$RUN_USER" 2>/dev/null; elif have deluser; then deluser "$RUN_USER" 2>/dev/null; fi
@@ -1166,7 +1557,9 @@ first_install() {
   install_glider
   ensure_user || warn "创建 $RUN_USER 用户失败，将以 root 运行代理程序。"
   ok "安装完成，命令 geo 已就绪"
+  if [ -z "$(active_name)" ] && check_ip; then save_real_ip; fi
   if [ -n "$(list_profiles)" ]; then
+    migrate_profiles
     menu
   else
     add_profile
@@ -1184,7 +1577,9 @@ main() {
     install.sh|*install*) first_install; exit ;;
     *)
       if [ -f "$PROFILES/$me.conf" ]; then
-        need_root; detect_virt; detect_system; use_profile "$me"; exit
+        need_root; detect_virt; detect_system; migrate_profiles
+        [ "$MIGRATED" = "$me" ] || use_profile "$me"
+        exit
       fi
       ;;
   esac
@@ -1200,9 +1595,8 @@ main() {
   case $cmd in
     fw-up) detect_system; fw_up; exit ;;
     fw-down) fw_down; exit 0 ;;
-    boot) need_root; detect_system
-      a=$(active_name); [ -n "$a" ] && load_profile "$a" || exit 0
-      raw_start; fw_up; exit ;;
+    watch) need_root; detect_system; node_watch; exit ;;
+    boot) need_root; detect_system; apply_state; exit ;;
     -h|--help|help)
       cat <<EOF
 用法:
@@ -1223,6 +1617,7 @@ EOF
   need_root
   detect_virt
   detect_system
+  migrate_profiles
   case $cmd in
     '') menu ;;
     add) add_profile ;;
@@ -1236,7 +1631,7 @@ EOF
     uninstall) confirm "确定卸载吗？" n && uninstall ;;
     *)
       if [ -f "$PROFILES/$cmd.conf" ]; then
-        use_profile "$cmd"
+        [ "$MIGRATED" = "$cmd" ] || use_profile "$cmd"
       elif [ -f "$PROFILES/geo$cmd.conf" ]; then
         use_profile "geo$cmd"
       else
