@@ -6,7 +6,7 @@
 - 兼容 Alpine、Debian、Ubuntu、CentOS / Rocky / Alma、Arch，x86_64 / ARM 都可以
 - **64MB 内存的 Alpine 小鸡也能用**：纯 sh 脚本，不需要 Python；代理核心是一个静态程序，常驻内存约 10MB，小内存机器会自动开启省内存模式
 - 支持两种作用范围：**整机**（推荐，搭节点选这个）或 **本机代理端口**
-- OpenVZ / LXC 小鸡不允许改网络规则也没关系：脚本会自动接管 xray / sing-box / hysteria2 节点，让节点走这个出口
+- OpenVZ / LXC / Podman / Docker 小鸡不允许改网络规则也没关系：脚本会自动接管 xray / sing-box / hysteria2 节点，让节点走这个出口
 
 ## 安装（root 运行）
 
@@ -62,7 +62,7 @@ SOCKS5 的写法这几种都认：
 
 1. **改网络规则（iptables）**：KVM、独服、大多数 LXC 都行。脚本会依次试 `iptables`、`iptables-legacy`、`iptables-nft`，老内核的 OpenVZ 小鸡也常常能用 legacy 版成功。
 2. **节点接管**：上面都不行时自动改用这个。脚本会在 xray / sing-box / hysteria2 的配置里加一个出站，让节点的流量走出口 IP。之后再搭节点也没关系，装好后 20 秒内自动接管。卸载 geo 时会把节点配置改回原样。
-   - 支持的配置位置：`/etc/sing-box/config.json`、`/usr/local/etc/sing-box/config.json`、`/etc/xray/config.json`、`/usr/local/etc/xray/config.json`、`/etc/v2ray/config.json`、`/usr/local/etc/v2ray/config.json`、`/etc/hysteria/config.yaml`（一键脚本装的一般都在这些位置）
+   - 不管节点是用哪个脚本装的、配置放在哪里都行：脚本直接找正在运行的 xray / v2ray / sing-box / hysteria 进程，读出它用的配置文件，改完后通过它自己的服务重启
    - x-ui / 3x-ui 这类面板会自己重写配置，接管不了，请在面板里加一个 SOCKS 出站 `127.0.0.1:61082`
    - 节点接管模式下，节点以外的程序（比如 curl）还是走本机 IP
 
