@@ -8,7 +8,7 @@
 #                    geooff         (back to this machine's own IP)
 
 # shellcheck disable=SC1007,SC1091,SC2015,SC2046,SC2154
-GEO_VERSION=2.1.0
+GEO_VERSION=2.1.1
 GLIDER_VERSION=0.16.4
 REPO_RAW=${GEO_REPO_RAW:-https://raw.githubusercontent.com/imthnio/vps-geo/main}
 # Prefix for GitHub downloads on machines that can't reach GitHub directly,
@@ -745,18 +745,77 @@ probe_v6() {
 # point the proxy nodes' own outbound at glider instead. glider keeps
 # listening on COMPAT_PORT, so switching exits never touches node configs.
 
+# Well-known config locations, used when the node isn't running right now.
 NODE_CONFS="/etc/sing-box/config.json /usr/local/etc/sing-box/config.json
 /etc/xray/config.json /usr/local/etc/xray/config.json
 /etc/v2ray/config.json /usr/local/etc/v2ray/config.json
 /etc/hysteria/config.yaml /etc/hysteria/config.yml"
+# Configs found from running processes are remembered here ("config|binary").
+NODE_LIST=$ETC/nodes
 
+node_is_proxy_bin() {
+  case ${1##*/} in
+    xray*|v2ray*|sing-box*|singbox*|sb|hysteria*|hy2*) return 0 ;;
+  esac
+  return 1
+}
+
+# The config file a process was started with ("" if it can't be told).
+node_proc_conf() { # /proc/PID
+  _pc=$(tr '\0' '\n' <"$1/cmdline" 2>/dev/null | awk '
+    p {print; exit}
+    /^(-c|-config|--config|-C|-confdir|--config-directory)$/ {p = 1; next}
+    /^-+(c|config)=/ {sub(/^[^=]*=/, ""); print; exit}')
+  [ -n "$_pc" ] || return 1
+  case $_pc in
+    /*) ;;
+    *) _pc=$(readlink "$1/cwd" 2>/dev/null)/$_pc ;;
+  esac
+  if [ -d "$_pc" ]; then
+    _pc=$(grep -l '"outbounds"' "$_pc"/*.json 2>/dev/null | head -n 1)
+  fi
+  [ -f "$_pc" ] && echo "$_pc"
+}
+
+# Nodes running right now, whatever script installed them: "config|binary".
+node_discover() {
+  for _d in /proc/[0-9]*; do
+    _exe=$(readlink "$_d/exe" 2>/dev/null) || continue
+    _exe=${_exe% (deleted)}
+    node_is_proxy_bin "$_exe" || continue
+    _cfg=$(node_proc_conf "$_d") || continue
+    echo "$_cfg|$_exe"
+  done
+}
+
+# Every node config we know about, running ones first.
+node_all() {
+  {
+    node_discover
+    cat "$NODE_LIST" 2>/dev/null
+    for _c in $NODE_CONFS; do echo "$_c|"; done
+  } | awk -F'|' '$1 != "" && !seen[$1]++'
+}
+
+node_pid() { # config
+  for _d in /proc/[0-9]*; do
+    _exe=$(readlink "$_d/exe" 2>/dev/null) || continue
+    node_is_proxy_bin "${_exe% (deleted)}" || continue
+    [ "$(node_proc_conf "$_d")" = "$1" ] && { echo "${_d#/proc/}"; return 0; }
+  done
+  return 1
+}
+
+# Tell the config dialect from its content, not from where it lives.
 node_kind() {
   case $1 in
-    *sing-box*) echo sing-box ;;
-    *xray*) echo xray ;;
-    *v2ray*) echo v2ray ;;
-    *hysteria*) echo hysteria ;;
+    *.yaml|*.yml) grep -qs '^listen:' "$1" && echo hysteria; return ;;
   esac
+  if grep -qs '"listen_port"\|"server_port"' "$1"; then
+    echo sing-box
+  elif grep -qs '"protocol"' "$1"; then
+    echo xray
+  fi
 }
 
 ensure_jq() {
@@ -772,33 +831,65 @@ node_bin() { # name
   return 1
 }
 
-node_test() { # kind file
+node_test() { # kind file binary
+  _b=$3
+  [ -n "$_b" ] && [ -x "$_b" ] || _b=$(node_bin "$1") || return 0
   case $1 in
-    sing-box) _b=$(node_bin sing-box) || return 0; "$_b" check -c "$2" >/dev/null 2>&1 ;;
-    xray) _b=$(node_bin xray) || return 0
-      "$_b" run -test -c "$2" >/dev/null 2>&1 || "$_b" -test -config "$2" >/dev/null 2>&1 ;;
+    sing-box) "$_b" check -c "$2" >/dev/null 2>&1 ;;
+    xray) "$_b" run -test -c "$2" >/dev/null 2>&1 || "$_b" -test -config "$2" >/dev/null 2>&1 ;;
     *) return 0 ;;
   esac
 }
 
-node_restart() { # kind
-  case $1 in
+# Restart whatever runs this config: its service if it has one, else the
+# process itself.
+node_restart() { # config kind
+  _pid=$(node_pid "$1")
+  if [ -n "$_pid" ] && [ "$INIT" = systemd ]; then
+    _u=$(sed -n 's#.*/\([^/]*\.service\)$#\1#p' "/proc/$_pid/cgroup" 2>/dev/null | head -n 1)
+    [ -n "$_u" ] && systemctl restart "$_u" >/dev/null 2>&1 && return 0
+  fi
+  if [ -n "$_pid" ] && [ "$INIT" = openrc ]; then
+    _pp=$(awk '/^PPid:/ {print $2}' "/proc/$_pid/status" 2>/dev/null)
+    for _pf in /run/*.pid /run/*/*.pid; do
+      [ -f "$_pf" ] || continue
+      _v=$(cat "$_pf" 2>/dev/null)
+      [ "$_v" = "$_pid" ] || [ "$_v" = "$_pp" ] || continue
+      _s=$(basename "$_pf" .pid)
+      [ -f "/etc/init.d/$_s" ] && rc-service "$_s" restart >/dev/null 2>&1 && return 0
+    done
+    _s=$(tr '\0' ' ' <"/proc/$_pp/cmdline" 2>/dev/null | sed -n 's/^supervise-daemon \([^ ]*\) .*/\1/p')
+    [ -n "$_s" ] && [ -f "/etc/init.d/$_s" ] && rc-service "$_s" restart >/dev/null 2>&1 && return 0
+  fi
+  case $2 in
     sing-box) _svcs="sing-box sb singbox" ;;
-    xray) _svcs=xray ;;
-    v2ray) _svcs=v2ray ;;
+    xray) _svcs="xray v2ray" ;;
     hysteria) _svcs="hysteria-server hysteria hysteria2 hy2" ;;
+    *) _svcs= ;;
   esac
   for _s in $_svcs; do
     case $INIT in
       systemd)
         systemctl cat "$_s" >/dev/null 2>&1 || continue
-        systemctl restart "$_s" && return 0 ;;
+        systemctl restart "$_s" >/dev/null 2>&1 && return 0 ;;
       openrc)
         [ -f "/etc/init.d/$_s" ] || continue
         rc-service "$_s" restart >/dev/null 2>&1 && return 0 ;;
     esac
   done
-  return 1
+  # No service owns it: stop the process and start the same command again
+  # (unless something respawns it first).
+  [ -n "$_pid" ] || return 1
+  cp "/proc/$_pid/cmdline" "$ETC/.cmdline" 2>/dev/null || return 1
+  _cwd=$(readlink "/proc/$_pid/cwd" 2>/dev/null)
+  kill "$_pid" 2>/dev/null
+  sleep 3
+  if ! node_pid "$1" >/dev/null; then
+    (cd "${_cwd:-/}" 2>/dev/null && xargs -0 sh -c 'nohup "$@" >/dev/null 2>&1 &' sh <"$ETC/.cmdline")
+    sleep 1
+  fi
+  rm -f "$ETC/.cmdline"
+  node_pid "$1" >/dev/null
 }
 
 # Configs that failed once are skipped until their content changes.
@@ -813,11 +904,13 @@ node_skip() { # file reason
   warn "没法自动接管 $1：$2"
 }
 
-node_inject() { # file
+node_inject() { # file [binary]
   _f=$1
-  _k=$(node_kind "$_f")
+  _nb=${2:-}
   grep -q "$NODE_TAG" "$_f" 2>/dev/null && return 0
   node_skipped "$_f" && return 1
+  _k=$(node_kind "$_f")
+  [ -n "$_k" ] || return 1
   mkdir -p "$ETC/backup"
   cp "$_f" "$ETC/backup/$(printf '%s' "$_f" | tr / _)"
   case $_k in
@@ -829,7 +922,7 @@ node_inject() { # file
       printf '\n# %s: added by vps-geo\noutbounds:\n  - name: %s\n    type: socks5\n    socks5:\n      addr: 127.0.0.1:%s\n' \
         "$NODE_TAG" "$NODE_TAG" "$COMPAT_PORT" >>"$_f"
       ;;
-    sing-box|xray|v2ray)
+    sing-box|xray)
       ensure_jq || { node_skip "$_f" "装不上 jq"; return 1; }
       if [ "$_k" = sing-box ]; then
         # Remember the original default outbound so uninstall can restore it.
@@ -852,25 +945,25 @@ node_inject() { # file
       cat "$_f.geo" >"$_f"
       rm -f "$_f.geo"
       ;;
-    *) return 1 ;;
   esac
-  if ! node_test "$_k" "$_f"; then
+  if ! node_test "$_k" "$_f" "$_nb"; then
     cat "$ETC/backup/$(printf '%s' "$_f" | tr / _)" >"$_f"
     node_skip "$_f" "改完后 $_k 自检不通过，已还原"
     return 1
   fi
-  if node_restart "$_k"; then
+  grep -qsF "$_f|" "$NODE_LIST" || echo "$_f|$_nb" >>"$NODE_LIST"
+  if node_restart "$_f" "$_k"; then
     ok "已接管 $_k 节点（$_f），它的出口会跟着 geo 切换。"
   else
-    ok "已接管 $_k 节点（$_f）。没找到它的服务，请手动重启一次 $_k。"
+    ok "已接管 $_k 节点（$_f）。没能自动重启它，请手动重启一次节点。"
   fi
   return 0
 }
 
 node_release() { # file
   _f=$1
-  _k=$(node_kind "$_f")
   grep -q "$NODE_TAG" "$_f" 2>/dev/null || return 0
+  _k=$(node_kind "$_f")
   case $_k in
     hysteria)
       # Drop our appended block and the blank line in front of it.
@@ -890,19 +983,39 @@ node_release() { # file
       rm -f "$_f.geo"
       ;;
   esac
-  node_restart "$_k"
+  node_restart "$_f" "$_k"
   say "已把 $_k 节点恢复成直连出站（$_f）。"
 }
 
-# Inject into every node config found; NODES_TAKEN lists the ones in use.
+# Nodes whose config currently points at geo, as "kind(config)" words.
+node_taken() {
+  node_all >"$ETC/.nodes"
+  while IFS='|' read -r _nf _nx; do
+    grep -qs "$NODE_TAG" "$_nf" && printf ' %s(%s)' "$(node_kind "$_nf")" "$_nf"
+  done <"$ETC/.nodes"
+  rm -f "$ETC/.nodes"
+}
+
+# Take over every node found; NODES_TAKEN lists the ones now using geo.
 node_scan() {
   NODES_TAKEN=
   mkdir "$ETC/.lock" 2>/dev/null || return 0
-  for _nf in $NODE_CONFS; do
+  node_all >"$ETC/.scan"
+  while IFS='|' read -r _nf _nx; do
     [ -f "$_nf" ] || continue
-    node_inject "$_nf" && NODES_TAKEN="$NODES_TAKEN $(node_kind "$_nf")"
-  done
+    node_inject "$_nf" "$_nx" </dev/null
+  done <"$ETC/.scan"
+  rm -f "$ETC/.scan"
   rmdir "$ETC/.lock" 2>/dev/null
+  NODES_TAKEN=$(node_taken)
+}
+
+node_release_all() {
+  node_all >"$ETC/.scan"
+  while IFS='|' read -r _nf _nx; do
+    [ -f "$_nf" ] && node_release "$_nf" </dev/null
+  done <"$ETC/.scan"
+  rm -f "$ETC/.scan"
 }
 
 # Runs as a service in compat mode, so nodes installed later are taken over too.
@@ -1295,7 +1408,7 @@ use_profile() {
       else
         say "  还没发现节点。现在去搭节点就行，装好后 20 秒内自动接管，不用再做别的。"
       fi
-      say "  支持 xray、sing-box、hysteria2（用一键脚本装的一般都行）。"
+      say "  支持 xray、sing-box、hysteria2，不管是用哪个脚本装的。"
       [ -n "$_real" ] && say "  节点地址填本机 IP: ${C_G}$_real${C_0}"
       ;;
     port)
@@ -1340,11 +1453,8 @@ show_status() {
   esac
   say "当前出口: $C_G$a$C_0（$_how）"
   if [ "$_st" = compat ]; then
-    _nodes=
-    for _nf in $NODE_CONFS; do
-      grep -qs "$NODE_TAG" "$_nf" && _nodes="$_nodes $(node_kind "$_nf")"
-    done
-    say "已接管节点: ${_nodes:- 还没有（装好节点后 20 秒内自动接管）}"
+    _nodes=$(node_taken)
+    say "已接管节点:${_nodes:- 还没有（装好节点后 20 秒内自动接管）}"
   fi
   if ! svc_running; then
     warn "代理程序没在运行，输入 $a 重新启动它。"
@@ -1483,9 +1593,7 @@ del_profile() { # name
 }
 
 uninstall() {
-  for f in $NODE_CONFS; do
-    [ -f "$f" ] && node_release "$f"
-  done
+  node_release_all
   rm -f "$ACTIVE" "$ETC/compat"
   svc_stop_all
   rm -f /etc/systemd/system/geo.service /etc/systemd/system/geo-fw.service \
