@@ -8,7 +8,7 @@
 #                    geooff         (back to this machine's own IP)
 
 # shellcheck disable=SC1007,SC1091,SC2015,SC2046,SC2154
-GEO_VERSION=3.0.0
+GEO_VERSION=3.0.1
 GLIDER_VERSION=0.16.4
 REPO_RAW=${GEO_REPO_RAW:-https://raw.githubusercontent.com/imthnio/vps-geo/main}
 # Prefix for GitHub downloads on machines that can't reach GitHub directly,
@@ -684,7 +684,12 @@ fw_up() {
   load_ipt || return 1
   fw_down
   # Per-node exits (menu 2) are dialled directly by the nodes, not via glider.
-  ips=$( { resolve_host "$(proxy_host "$PROXY")"; nx_exit_ips; } | sort -u)
+  pips=$(resolve_host "$(proxy_host "$PROXY")")
+  ips=$( { printf '%s\n' "$pips"; nx_exit_ips; } | grep . | sort -u)
+  ips4= ips6=
+  for ip in $ips; do
+    case $ip in *:*) ips6="$ips6 $ip" ;; *) ips4="$ips4 $ip" ;; esac
+  done
   owner=0
   $IPT -t nat -N $CHAIN || return 1
   for n in $V4_PRIVATE; do
@@ -699,7 +704,7 @@ fw_up() {
     $IPT -t nat -A $CHAIN -m owner --uid-owner "$RUN_USER" -j RETURN >/dev/null 2>&1; then
     owner=1
   fi
-  if [ "$owner" = 0 ] && [ -z "$ips" ]; then
+  if [ "$owner" = 0 ] && [ -z "$pips" ]; then
     fw_down
     err "解析不到代理服务器地址，系统也不支持按用户排除流量，整机模式无法安全开启。"
     return 1
@@ -707,7 +712,8 @@ fw_up() {
   $IPT -t nat -A $CHAIN -p tcp -j REDIRECT --to-ports $REDIR_PORT || { fw_down; return 1; }
   $IPT -t nat -A OUTPUT -p tcp -j $CHAIN || { fw_down; return 1; }
   # shellcheck disable=SC2086
-  fw_udp "$IPT" $V4_PRIVATE || warn "这台机器没法拦截 UDP，节点的 UDP 流量（如 QUIC）可能用本机 IP 出去。"
+  # Exit servers stay reachable over UDP too (nodes relay UDP through them).
+  fw_udp "$IPT" $V4_PRIVATE $ips4 || warn "这台机器没法拦截 UDP，节点的 UDP 流量（如 QUIC）可能用本机 IP 出去。"
 
   # IPv6: proxy it if the kernel allows, otherwise refuse it so programs
   # fall back to IPv4 instead of leaking the real address.
@@ -734,7 +740,7 @@ fw_up() {
     $t -A $CHAIN -p tcp $last >/dev/null 2>&1 && $t -A OUTPUT -p tcp -j $CHAIN >/dev/null 2>&1 ||
       warn "IPv6 规则设置失败，访问 IPv6 网站时会露出本机 IP。"
     # shellcheck disable=SC2086
-    fw_udp "$IP6T" $V6_PRIVATE >/dev/null 2>&1
+    fw_udp "$IP6T" $V6_PRIVATE $ips6 >/dev/null 2>&1
   fi
   return 0
 }
@@ -789,6 +795,28 @@ node_proc_conf() { # /proc/PID
   [ -f "$_pc" ] && echo "$_pc"
 }
 
+# Every config file a node process loads, in the order it loads them:
+# the -c / -config files first, then the *.json in -confdir / -C directories.
+# (Some install scripts split one node over many files in a directory.)
+node_proc_files() { # /proc/PID
+  _cw=$(readlink "$1/cwd" 2>/dev/null)
+  tr '\0' '\n' <"$1/cmdline" 2>/dev/null | awk '
+    p {print; p = 0; next}
+    /^(-c|-config|--config|-C|-confdir|--confdir|--config-directory)$/ {p = 1; next}
+    /^-+(c|config|C|confdir|config-directory)=/ {sub(/^[^=]*=/, ""); print}' >"$ETC/.pf"
+  for _pass in file dir; do
+    while IFS= read -r _a; do
+      case $_a in /*) ;; *) _a=$_cw/$_a ;; esac
+      if [ "$_pass" = file ] && [ -f "$_a" ]; then
+        echo "$_a"
+      elif [ "$_pass" = dir ] && [ -d "$_a" ]; then
+        for _j in "$_a"/*.json; do [ -f "$_j" ] && echo "$_j"; done
+      fi
+    done <"$ETC/.pf"
+  done
+  rm -f "$ETC/.pf"
+}
+
 # Nodes running right now, whatever script installed them: "config|binary".
 node_discover() {
   for _d in /proc/[0-9]*; do
@@ -822,13 +850,26 @@ node_pid() { # config
 # Tell the config dialect from its content, not from where it lives.
 node_kind() {
   case $1 in
-    *.yaml|*.yml) grep -qs '^listen:' "$1" && echo hysteria; return ;;
+    *.yaml|*.yml) grep -qs '^listen:\|^auth:\|^acme:\|^tls:' "$1" && echo hysteria; return ;;
   esac
   if grep -qs '"listen_port"\|"server_port"' "$1"; then
     echo sing-box
   elif grep -qs '"protocol"' "$1"; then
     echo xray
+  elif grep -qs '"type"' "$1" && ! grep -qs '"outboundTag"\|"inboundTag"' "$1"; then
+    # e.g. a split sing-box config whose main file only has {"type": "direct"}
+    echo sing-box
   fi
+}
+
+# Same, but trust the program's name when we know which one runs the config.
+node_kind_bin() { # config binary
+  case ${2##*/} in
+    xray*|v2ray*) echo xray ;;
+    sing-box*|singbox*|sb) echo sing-box ;;
+    hysteria*|hy2*) echo hysteria ;;
+    *) node_kind "$1" ;;
+  esac
 }
 
 ensure_jq() {
@@ -922,7 +963,7 @@ node_inject() { # file [binary]
   _nb=${2:-}
   grep -q "$NODE_TAG" "$_f" 2>/dev/null && return 0
   node_skipped "$_f" && return 1
-  _k=$(node_kind "$_f")
+  _k=$(node_kind_bin "$_f" "$_nb")
   [ -n "$_k" ] || return 1
   # A hysteria node with its own exit (menu 2) keeps it.
   [ "$_k" = hysteria ] && grep -qF "$NX_MARK" "$_f" && return 1
@@ -1052,7 +1093,8 @@ node_watch() {
 
 EXITS=$ETC/exits          # 名字<TAB>host<TAB>port<TAB>user<TAB>pass
 BINDS=$ETC/binds          # config<TAB>inbound-tag<TAB>名字   (hysteria: tag "*")
-NX_ROWS=$ETC/.nxrows      # config kind tag proto port binary  (last scan)
+NX_SETS=$ETC/nodesets     # config<TAB>file: every file a node loads (split configs)
+NX_ROWS=$ETC/.nxrows      # config kind tag proto port binary inbound-file (last scan)
 NX_MARK="# geo-x: added by vps-geo"
 TAB=$(printf '\t')
 
@@ -1071,38 +1113,53 @@ def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
 def isgeo: startswith("geo-x-");
 '
 
-# Rewrite one xray / sing-box config from $binds ("tag<TAB>名字" lines) and
-# $exits. Our rules go first, after any leading block / sniff-type rules,
-# so they win over the node's own routing but keep its ad / private blocks.
+# Rewrite one file of an xray / sing-box node. Bindings ("tag<TAB>名字"),
+# exits and the block-outbound tags come in through the environment, so
+# passwords never show up in the process list.
+#   $ob = 1: this file gets our socks outbounds   (the node's main config)
+#   $ru = 1: this file gets our routing rules     (the file whose routing wins)
+#   $tg = 1: give untagged inbounds a tag
+# Our rules go first, after any leading block / sniff-type rules, so they win
+# over the node's own routing but keep its ad / private-network blocks.
 NX_JQ='
-fixtags
-| rows($binds) as $b
-| rows($exits) as $e
+(if $tg == "1" then fixtags else . end)
+| rows(env.GEO_NX_BINDS) as $b
+| rows(env.GEO_NX_EXITS) as $e
+| (env.GEO_NX_BLK | split("\n") | map(select(length > 0))) as $blk
 | [$b[] | .[1]] as $used
 | [$e[] | select(.[0] as $l | any($used[]; . == $l))] as $ue
-| (.outbounds // []) as $ob
-| if $kind == "xray" then
-    [$ob[] | select(.protocol == "blackhole") | .tag // empty] as $blk
-    | .outbounds = ([$ob[] | select((.tag // "") | isgeo | not)]
-        + [$ue[] | {tag: ("geo-x-" + .[0]), protocol: "socks",
+| if $ob == "1" or (.outbounds | type) == "array" then
+    .outbounds = ([(.outbounds // [])[] | select((.tag // "") | isgeo | not)]
+      + if $ob != "1" then []
+        elif $kind == "xray" then
+          [$ue[] | {tag: ("geo-x-" + .[0]), protocol: "socks",
             settings: {servers: [{address: .[1], port: (.[2] | tonumber)}
-              + (if .[3] != "" then {users: [{user: .[3], pass: .[4]}]} else {} end)]}}])
-    | [$ue[] | .[0] as $l | {type: "field", inboundTag: [$b[] | select(.[1] == $l) | .[0]], outboundTag: ("geo-x-" + $l)}] as $mine
-    | [(.routing.rules // [])[] | select((.outboundTag // "") | isgeo | not)] as $r
-    | ([range(0; $r | length) | select(($r[.].outboundTag // "") as $t | any($blk[]; . == $t) | not)] | .[0] // ($r | length)) as $n
-    | if ($r | length) == 0 and ($mine | length) == 0 then .
-      else .routing = ((.routing // {}) + {rules: ($r[0:$n] + $mine + $r[$n:])}) end
+              + (if .[3] != "" then {users: [{user: .[3], pass: .[4]}]} else {} end)]}}]
+        else
+          [$ue[] | {type: "socks", tag: ("geo-x-" + .[0]), server: .[1], server_port: (.[2] | tonumber), version: "5"}
+            + (if .[3] != "" then {username: .[3], password: .[4]} else {} end)]
+        end)
+  else . end
+| if $kind == "xray" then
+    (if $ru == "1" then [$ue[] | .[0] as $l | {type: "field", inboundTag: [$b[] | select(.[1] == $l) | .[0]], outboundTag: ("geo-x-" + $l)}] else [] end) as $mine
+    | if (.routing.rules | type) == "array" or ($mine | length) > 0 then
+        [(.routing.rules // [])[] | select((.outboundTag // "") | isgeo | not)] as $r
+        | ([range(0; $r | length) | select(($r[.].outboundTag // "") as $t | any($blk[]; . == $t) | not)] | .[0] // ($r | length)) as $n
+        | ($r[0:$n] + $mine + $r[$n:]) as $all
+        # An empty "routing" left behind would wipe the routing of earlier files.
+        | if ($all | length) == 0 and (((.routing // {}) | keys) - ["rules"] | length) == 0 then del(.routing)
+          else .routing = ((.routing // {}) + {rules: $all}) end
+      else . end
   else
-    [$ob[] | select(.type == "block") | .tag // empty] as $blk
-    | .outbounds = ([$ob[] | select((.tag // "") | isgeo | not)]
-        + [$ue[] | {type: "socks", tag: ("geo-x-" + .[0]), server: .[1], server_port: (.[2] | tonumber), version: "5"}
-            + (if .[3] != "" then {username: .[3], password: .[4]} else {} end)])
-    | [$ue[] | .[0] as $l | {inbound: [$b[] | select(.[1] == $l) | .[0]], outbound: ("geo-x-" + $l)}] as $mine
-    | [(.route.rules // [])[] | select((.outbound // "") | isgeo | not)] as $r
-    | ([range(0; $r | length) | select($r[.] as $x | ((($x.action // "route") != "route")
-          or (($x.outbound // "") as $t | any($blk[]; . == $t))) | not)] | .[0] // ($r | length)) as $n
-    | if ($r | length) == 0 and ($mine | length) == 0 then .
-      else .route = ((.route // {}) + {rules: ($r[0:$n] + $mine + $r[$n:])}) end
+    (if $ru == "1" then [$ue[] | .[0] as $l | {inbound: [$b[] | select(.[1] == $l) | .[0]], outbound: ("geo-x-" + $l)}] else [] end) as $mine
+    | if (.route.rules | type) == "array" or ($mine | length) > 0 then
+        [(.route.rules // [])[] | select((.outbound // "") | isgeo | not)] as $r
+        | ([range(0; $r | length) | select($r[.] as $x | ((($x.action // "route") != "route")
+              or (($x.outbound // "") as $t | any($blk[]; . == $t))) | not)] | .[0] // ($r | length)) as $n
+        | ($r[0:$n] + $mine + $r[$n:]) as $all
+        | if ($all | length) == 0 and (((.route // {}) | keys) - ["rules"] | length) == 0 then del(.route)
+          else .route = ((.route // {}) + {rules: $all}) end
+      else . end
   end
 '
 
@@ -1117,7 +1174,15 @@ nx_valid_label() {
 parse_exit() {
   _pe=$(printf '%s' "$1" | tr -d ' \t\r')
   E_LABEL=
-  case $_pe in *'#'*) E_LABEL=${_pe##*#}; _pe=${_pe%#*} ;; esac
+  case $_pe in
+    *'#'*)
+      # A "#" inside the password is not a name: names have no @ : /
+      case ${_pe##*#} in
+        *@*|*:*|*/*) ;;
+        *) E_LABEL=${_pe##*#}; _pe=${_pe%#*} ;;
+      esac
+      ;;
+  esac
   parse_proxy "$_pe" || return 1
   E_HOST=$(printf '%s' "$P_HOST" | tr -d '[]')
   E_PORT=$P_PORT E_USER=$P_USER E_PASS=$P_PASS
@@ -1258,14 +1323,48 @@ nx_fw_refresh() {
   return 0
 }
 
+# Remember which files each running node loads, for configs split over
+# several files (xray -confdir, sing-box -C).
+nx_learn_sets() {
+  umask 077
+  touch "$NX_SETS"
+  for _d in /proc/[0-9]*; do
+    _exe=$(readlink "$_d/exe" 2>/dev/null) || continue
+    node_is_proxy_bin "${_exe% (deleted)}" || continue
+    _cfg=$(node_proc_conf "$_d") || continue
+    node_proc_files "$_d" >"$ETC/.nxpf"
+    grep -qxF "$_cfg" "$ETC/.nxpf" || echo "$_cfg" >>"$ETC/.nxpf"
+    F=$_cfg awk -F'\t' '$1 != ENVIRON["F"]' "$NX_SETS" >"$NX_SETS.new"
+    while IFS= read -r _x; do
+      printf '%s\t%s\n' "$_cfg" "$_x"
+    done <"$ETC/.nxpf" >>"$NX_SETS.new"
+    mv "$NX_SETS.new" "$NX_SETS"
+  done
+  rm -f "$ETC/.nxpf"
+}
+
+# Files of one node, in load order (just the config itself if it isn't split).
+nx_set_files() { # config
+  _sf=$(F=$1 awk -F'\t' '$1 == ENVIRON["F"] {print $2}' "$NX_SETS" 2>/dev/null)
+  if [ -z "$_sf" ]; then
+    echo "$1"
+    return 0
+  fi
+  printf '%s\n' "$_sf" | while IFS= read -r _x; do
+    [ -f "$_x" ] && echo "$_x"
+  done
+}
+
 # Find every node: one row per xray / sing-box inbound, one per hysteria config.
 nx_scan() {
+  umask 077
   : >"$NX_ROWS"
   NX_BAD=
+  nx_learn_sets
   node_all >"$ETC/.nxall"
   while IFS='|' read -r _nf _nx; do
     [ -f "$_nf" ] || continue
-    _k=$(node_kind "$_nf")
+    _k=$(node_kind_bin "$_nf" "$_nx")
     [ -n "$_nx" ] || _nx=-
     case $_k in
       xray|sing-box)
@@ -1278,25 +1377,28 @@ nx_scan() {
         else
           _q='[.tag, (.type // "?"), ((.listen_port // "-") | tostring)]'
         fi
-        if ! jq -r "$NX_JQ_DEFS fixtags | (.inbounds // [])[] | select(.tag != \"api\") | $_q | @tsv" \
-          "$_nf" >"$ETC/.nxone" 2>/dev/null; then
-          NX_BAD="$NX_BAD $_nf"
-          continue
-        fi
-        while IFS="$TAB" read -r _t _p _po; do
-          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$_nf" "$_k" "$_t" "$_p" "${_po:--}" "$_nx"
-        done <"$ETC/.nxone" >>"$NX_ROWS"
+        nx_set_files "$_nf" >"$ETC/.nxset"
+        while IFS= read -r _x; do
+          if ! jq -r "$NX_JQ_DEFS fixtags | (.inbounds // [])[] | select(.tag != \"api\") | $_q | @tsv" \
+            "$_x" >"$ETC/.nxone" 2>/dev/null; then
+            NX_BAD="$NX_BAD $_x"
+            continue
+          fi
+          while IFS="$TAB" read -r _t _p _po; do
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$_nf" "$_k" "$_t" "$_p" "${_po:--}" "$_nx" "$_x"
+          done <"$ETC/.nxone" >>"$NX_ROWS"
+        done <"$ETC/.nxset"
         ;;
       hysteria)
         _po=$(sed -n 's/^listen:.*:\([0-9][0-9]*\).*/\1/p' "$_nf" | head -n 1)
-        printf '%s\t%s\t*\thysteria2\t%s\t%s\n' "$_nf" "$_k" "${_po:--}" "$_nx" >>"$NX_ROWS"
+        printf '%s\t%s\t*\thysteria2\t%s\t%s\t%s\n' "$_nf" "$_k" "${_po:-443}" "$_nx" "$_nf" >>"$NX_ROWS"
         ;;
     esac
   done <"$ETC/.nxall"
-  rm -f "$ETC/.nxall" "$ETC/.nxone"
+  rm -f "$ETC/.nxall" "$ETC/.nxone" "$ETC/.nxset"
 }
 
-nx_row() { # n -> R_FILE R_KIND R_TAG R_PROTO R_PORT R_BIN
+nx_row() { # n -> R_FILE R_KIND R_TAG R_PROTO R_PORT R_BIN R_IN
   _rl=$(sed -n "${1}p" "$NX_ROWS")
   [ -n "$_rl" ] || return 1
   R_FILE=$(printf '%s\n' "$_rl" | cut -f1)
@@ -1305,6 +1407,7 @@ nx_row() { # n -> R_FILE R_KIND R_TAG R_PROTO R_PORT R_BIN
   R_PROTO=$(printf '%s\n' "$_rl" | cut -f4)
   R_PORT=$(printf '%s\n' "$_rl" | cut -f5)
   R_BIN=$(printf '%s\n' "$_rl" | cut -f6)
+  R_IN=$(printf '%s\n' "$_rl" | cut -f7)
 }
 
 nx_row_count() {
@@ -1316,6 +1419,7 @@ nx_row_count() {
 nx_show_nodes() {
   _run=$(node_discover | cut -d'|' -f1)
   _cnt=$(nx_row_count)
+  _state=$(cur_state)
   if [ "$_cnt" -eq 0 ]; then
     warn "没找到节点。"
     say "  支持 xray / v2ray / sing-box / hysteria2。节点要正在运行，或者配置在常见位置。"
@@ -1331,13 +1435,21 @@ nx_show_nodes() {
       _st="$(hr 未运行)"
       printf '%s\n' "$_run" | grep -qxF "$R_FILE" && _st="$(hg 运行中)"
       nx_is_panel "$R_FILE" && _st="$_st $(hy '面板管理，不能在这里改')"
+      _nfiles=$(nx_set_files "$R_FILE" | grep -c .)
       say ""
-      say "  $(hc_kind "$R_KIND")  $R_FILE  [$_st]"
+      if [ "$_nfiles" -gt 1 ]; then
+        say "  $(hc_kind "$R_KIND")  $R_FILE  （共 $_nfiles 个配置文件）  [$_st]"
+      else
+        say "  $(hc_kind "$R_KIND")  $R_FILE  [$_st]"
+      fi
     fi
     _lab=$(nx_bind_of "$R_FILE" "$R_TAG")
     if [ -z "$_lab" ]; then
       _ex="默认出站"
-      [ -f "$ETC/compat" ] && grep -qs "$NODE_TAG" "$R_FILE" && _ex="默认（菜单 1 的整机出口）"
+      case $_state in
+        nat) _ex="默认（菜单 1 整机出口 $(active_name)）" ;;
+        compat) grep -qs "$NODE_TAG" "$R_FILE" && _ex="默认（菜单 1 整机出口 $(active_name)）" ;;
+      esac
     elif ! nx_exit_get "$_lab"; then
       _ex="$(hr "$_lab（出口已不存在）")"
     elif grep -qsF "geo-x-$_lab" "$R_FILE"; then
@@ -1375,7 +1487,7 @@ nx_pick_exit() { # answer
   case $1 in
     '') return 1 ;;
     0|d|D|del|直连|解除) NX_PICK=-; return 0 ;;
-    *@*|*://*|*:*:*) nx_exit_add_line "$1" || return 1; NX_PICK=$NX_ADDED; return 0 ;;
+    *@*|*://*|*:*) nx_exit_add_line "$1" || return 1; NX_PICK=$NX_ADDED; return 0 ;;
     *[!0-9]*) nx_exit_get "$1" && { NX_PICK=$1; return 0; } ;;
     *) NX_PICK=$(nx_exit_labels | sed -n "${1}p"); [ -n "$NX_PICK" ] && return 0 ;;
   esac
@@ -1416,33 +1528,91 @@ yaml_drop() { # file marker
   rm -f "$1.geo"
 }
 
-# Rewrite one node config from $BINDS, check it, restart the node.
+# Short, unique name for a node file's copy under $ETC.
+nx_bk_name() { printf '%s-%s' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)" "${1##*/}"; }
+
+# Check a node's files with its own program: "xray run -test" / "sing-box check".
+# Error output goes to $ETC/.nxcheck. Returns 0 when it can't be checked.
+nx_check() { # kind binary files...
+  _ck=$1 _cb=$2
+  shift 2
+  [ -n "$_cb" ] && [ "$_cb" != - ] && [ -x "$_cb" ] || _cb=$(node_bin "$_ck") || return 0
+  _cn=$#
+  for _x in "$@"; do set -- "$@" -c "$_x"; done
+  shift "$_cn"
+  case $_ck in
+    sing-box) "$_cb" check "$@" >"$ETC/.nxcheck" 2>&1 ;;
+    xray) "$_cb" run -test "$@" >"$ETC/.nxcheck" 2>&1 || "$_cb" -test "$@" >/dev/null 2>&1 ||
+            "$_cb" test "$@" >/dev/null 2>&1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Rewrite a node's config files from $BINDS, check them, restart the node.
 nx_apply() { # config
   _f=$1
-  _k=$(node_kind "$_f")
   _bin=$(node_all | awk -F'|' -v f="$_f" '$1 == f {print $2; exit}')
+  _k=$(node_kind_bin "$_f" "$_bin")
   if nx_is_panel "$_f"; then
     err "$_f 由面板管理，面板会重写配置，请在面板里添加 socks 出站和路由规则。"
     return 1
   fi
-  mkdir -p "$ETC/backup-x"
-  # The very first original stays as a safety copy.
-  _orig=$ETC/backup-x/$(printf '%s' "$_f" | tr / _)
-  [ -f "$_orig" ] || cp "$_f" "$_orig"
-  cp "$_f" "$ETC/.nxprev"
+  umask 077
   _bl=$(F=$_f awk -F'\t' '$1 == ENVIRON["F"] {print $2 "\t" $3}' "$BINDS" 2>/dev/null)
+  nx_set_files "$_f" >"$ETC/.nxfiles"
+  grep -qxF "$_f" "$ETC/.nxfiles" || echo "$_f" >>"$ETC/.nxfiles"
+  # Keep copies: the very first original for good, and this round's version
+  # so a failed check can put every file back.
+  mkdir -p "$ETC/backup-x" "$ETC/.nxprev"
+  rm -f "$ETC/.nxprev"/*
+  while IFS= read -r _x; do
+    _bn=$(nx_bk_name "$_x")
+    [ -f "$ETC/backup-x/$_bn" ] || cp "$_x" "$ETC/backup-x/$_bn"
+    cp "$_x" "$ETC/.nxprev/$_bn"
+  done <"$ETC/.nxfiles"
+
   case $_k in
     xray|sing-box)
-      ensure_jq || { err "装不上 jq，没法修改节点配置。"; return 1; }
-      if ! jq --arg kind "$_k" --arg binds "$_bl" --arg exits "$(cat "$EXITS" 2>/dev/null)" \
-        "$NX_JQ_DEFS $NX_JQ" "$_f" >"$_f.geo" 2>/dev/null || [ ! -s "$_f.geo" ]; then
-        rm -f "$_f.geo" "$ETC/.nxprev"
-        err "$_f 不是标准 JSON（可能带注释），没法自动修改。"
+      ensure_jq || { nx_cleanup; err "装不上 jq，没法修改节点配置。"; return 1; }
+      # xray: a later file's "routing" replaces the earlier ones, so our rules
+      # go into the last file that has one. sing-box appends rules across files.
+      _rf=$_f
+      if [ "$_k" = xray ]; then
+        _last=
+        while IFS= read -r _x; do
+          grep -qs '"routing"' "$_x" && _last=$_x
+        done <"$ETC/.nxfiles"
+        [ -n "$_last" ] && _rf=$_last
+      fi
+      _blk=$(while IFS= read -r _x; do
+          jq -r '(.outbounds // [])[] | select(.protocol == "blackhole" or .type == "block") | .tag // empty' "$_x" 2>/dev/null
+        done <"$ETC/.nxfiles")
+      _fail=
+      while IFS= read -r _x; do
+        _ob=0 _ru=0 _tg=0
+        [ "$_x" = "$_f" ] && _ob=1
+        [ "$_x" = "$_rf" ] && _ru=1
+        # Untagged inbounds only need a tag while this node has bindings.
+        [ -n "$_bl" ] && jq -e '[(.inbounds // [])[] | select((.tag // "") == "")] | length > 0' "$_x" >/dev/null 2>&1 && _tg=1
+        [ "$_ob$_ru$_tg" = 000 ] && ! grep -qs 'geo-x-' "$_x" && continue
+        if ! GEO_NX_BINDS=$_bl GEO_NX_EXITS=$(cat "$EXITS" 2>/dev/null) GEO_NX_BLK=$_blk \
+          jq --arg kind "$_k" --arg ob "$_ob" --arg ru "$_ru" --arg tg "$_tg" \
+          "$NX_JQ_DEFS $NX_JQ" "$_x" >"$ETC/.nxout" 2>/dev/null || [ ! -s "$ETC/.nxout" ]; then
+          _fail=$_x
+          break
+        fi
+        # Write in place so the file keeps its owner and permissions; leave
+        # files alone when nothing changes (jq would only re-indent them).
+        if [ "$(jq -cS . "$ETC/.nxout")" != "$(jq -cS . "$_x")" ]; then
+          cat "$ETC/.nxout" >"$_x"
+        fi
+      done <"$ETC/.nxfiles"
+      rm -f "$ETC/.nxout"
+      if [ -n "$_fail" ]; then
+        nx_restore
+        err "$_fail 不是标准 JSON（可能带注释），没法自动修改，已还原。"
         return 1
       fi
-      # Write in place so the file keeps its owner and permissions.
-      cat "$_f.geo" >"$_f"
-      rm -f "$_f.geo"
       ;;
     hysteria)
       _lab=$(printf '%s\n' "$_bl" | awk -F'\t' 'NF {print $2; exit}')
@@ -1451,12 +1621,15 @@ nx_apply() { # config
         # Menu 1's takeover block gives way to the node's own exit.
         yaml_drop "$_f" "# $NODE_TAG: added by vps-geo"
         if grep -q '^outbounds:' "$_f"; then
-          cat "$ETC/.nxprev" >"$_f"
-          rm -f "$ETC/.nxprev"
+          nx_restore
           err "$_f 里已经有自己的 outbounds，请手动添加 socks5 出站。"
           return 1
         fi
-        nx_exit_get "$_lab" || { cat "$ETC/.nxprev" >"$_f"; err "出口 $_lab 不存在。"; return 1; }
+        if ! nx_exit_get "$_lab"; then
+          nx_restore
+          err "出口 $_lab 不存在。"
+          return 1
+        fi
         _addr=$E_HOST
         case $_addr in *:*) _addr="[$_addr]" ;; esac
         {
@@ -1467,29 +1640,47 @@ nx_apply() { # config
       fi
       ;;
     *)
-      rm -f "$ETC/.nxprev"
+      nx_cleanup
       err "认不出 $_f 是哪种节点配置。"
       return 1
       ;;
   esac
-  if cmp -s "$_f" "$ETC/.nxprev"; then
-    rm -f "$ETC/.nxprev"
+
+  _changed=0
+  while IFS= read -r _x; do
+    cmp -s "$_x" "$ETC/.nxprev/$(nx_bk_name "$_x")" || _changed=1
+  done <"$ETC/.nxfiles"
+  if [ "$_changed" = 0 ]; then
+    nx_cleanup
     return 0
   fi
-  [ "$_bin" = - ] && _bin=
-  if ! node_test "$_k" "$_f" "$_bin"; then
-    cat "$ETC/.nxprev" >"$_f"
-    rm -f "$ETC/.nxprev"
-    err "改完后 $_k 自检不通过，已把 $_f 还原。"
+  # shellcheck disable=SC2046
+  if ! nx_check "$_k" "$_bin" $(cat "$ETC/.nxfiles"); then
+    say "  自检输出:" >&2
+    tail -n 5 "$ETC/.nxcheck" 2>/dev/null | sed 's/^/    /' >&2
+    nx_restore
+    err "改完后 $_k 自检不通过，已把配置还原。"
     return 1
   fi
-  rm -f "$ETC/.nxprev"
+  nx_cleanup
   if node_restart "$_f" "$_k"; then
     ok "已更新并重启 $_k 节点（$_f）"
   else
     warn "已改好 $_f，但没能自动重启，请$(hy 手动重启一次节点)。"
   fi
   return 0
+}
+
+nx_restore() {
+  while IFS= read -r _x; do
+    _bn=$(nx_bk_name "$_x")
+    [ -f "$ETC/.nxprev/$_bn" ] && ! cmp -s "$ETC/.nxprev/$_bn" "$_x" && cat "$ETC/.nxprev/$_bn" >"$_x"
+  done <"$ETC/.nxfiles"
+  nx_cleanup
+}
+
+nx_cleanup() {
+  rm -rf "$ETC/.nxprev" "$ETC/.nxfiles" "$ETC/.nxcheck"
 }
 
 nx_apply_all() {
@@ -1621,6 +1812,7 @@ nx_edit_exit() {
 }
 
 nx_del_exit() {
+  umask 077
   title "删除出口"
   nx_pick_exit_existing "要删除哪个出口" || return 0
   _dl=$NX_PICK
@@ -1658,6 +1850,7 @@ nx_unbind() {
 }
 
 nx_add_node_path() {
+  umask 077
   title "手动添加节点配置文件"
   say "自动找不到节点时用：填节点的配置文件路径（xray / sing-box 的 json，或 hysteria2 的 yaml）。"
   ask in_path "配置文件路径（回车取消）"
