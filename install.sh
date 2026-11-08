@@ -8,7 +8,7 @@
 #                    geooff         (back to this machine's own IP)
 
 # shellcheck disable=SC1007,SC1091,SC2015,SC2046,SC2154
-GEO_VERSION=3.0.1
+GEO_VERSION=3.0.2
 GLIDER_VERSION=0.16.4
 REPO_RAW=${GEO_REPO_RAW:-https://raw.githubusercontent.com/imthnio/vps-geo/main}
 # Prefix for GitHub downloads on machines that can't reach GitHub directly,
@@ -22,6 +22,11 @@ GLIDER_CONF=$ETC/glider.conf
 BIN=/usr/local/bin
 SELF=$BIN/geo
 GLIDER=$BIN/geo-glider
+# Static jq for reading node configs; apt / yum need far more memory than a
+# 64MB box has, so we fetch the official single-file build instead.
+JQ_VERSION=1.8.2
+JQ_BIN=$BIN/geo-jq
+JQ_CMD=jq
 PIDFILE=/var/run/geo.pid
 WATCH_PIDFILE=/var/run/geo-watch.pid
 LOG=/var/log/geo.log
@@ -872,10 +877,65 @@ node_kind_bin() { # config binary
   esac
 }
 
+jq_arch() {
+  case $ARCH in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64|armv8*) echo arm64 ;;
+    armv7*) echo armhf ;;
+    armv6*|armv5*) echo armel ;;
+    i?86|x86) echo i386 ;;
+    riscv64) echo riscv64 ;;
+    ppc64le) echo ppc64el ;;
+    s390x) echo s390x ;;
+    mips64el|mips64le) echo mips64el ;;
+    mips64) echo mips64 ;;
+    mipsel|mipsle) echo mipsel ;;
+    mips) echo mips ;;
+    *) return 1 ;;
+  esac
+}
+
+# Sets JQ_CMD. Order: our own copy, the system jq, download, package manager.
 ensure_jq() {
-  have jq && return 0
-  pkg_install jq >/dev/null 2>&1
-  have jq
+  if [ -x "$JQ_BIN" ] && "$JQ_BIN" --version >/dev/null 2>&1; then
+    JQ_CMD=$JQ_BIN
+    return 0
+  fi
+  if have jq; then
+    JQ_CMD=jq
+    return 0
+  fi
+  [ -n "${JQ_TRIED:-}" ] && return 1
+  JQ_TRIED=1
+  if _ja=$(jq_arch); then
+    say "正在下载 jq（读取节点配置要用，约 2MB）..." >&2
+    _jn=jq-linux-$_ja
+    _jb="${GH_PROXY}https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION"
+    mkdir -p "$ETC"
+    if download "$_jb/$_jn" "$ETC/.jq"; then
+      if download "$_jb/sha256sum.txt" "$ETC/.jqsum" && have sha256sum; then
+        _want=$(awk -v f="$_jn" '$2 == f {print $1}' "$ETC/.jqsum")
+        _got=$(sha256sum "$ETC/.jq" | awk '{print $1}')
+        [ -n "$_want" ] && [ "$_want" = "$_got" ] || { rm -f "$ETC/.jq"; warn "jq 校验失败，没有使用。"; }
+      fi
+      rm -f "$ETC/.jqsum"
+      if [ -f "$ETC/.jq" ] && chmod 755 "$ETC/.jq" && "$ETC/.jq" --version >/dev/null 2>&1; then
+        mv "$ETC/.jq" "$JQ_BIN"
+        JQ_CMD=$JQ_BIN
+        ok "jq 已就绪" >&2
+        return 0
+      fi
+    fi
+    rm -f "$ETC/.jq"
+    warn "jq 下载或运行失败。连不上 GitHub 的话可以这样运行：GEO_GH_PROXY=https://ghfast.top/ geo"
+  fi
+  # The package manager can run a small box out of memory, so only on bigger ones.
+  if [ "${MEM_MB:-0}" -gt 256 ]; then
+    say "正在用系统包管理器安装 jq..." >&2
+    pkg_install jq >/dev/null 2>&1
+    have jq && { JQ_CMD=jq; return 0; }
+  fi
+  return 1
 }
 
 node_bin() { # name
@@ -982,12 +1042,12 @@ node_inject() { # file [binary]
       ensure_jq || { node_skip "$_f" "装不上 jq"; return 1; }
       if [ "$_k" = sing-box ]; then
         # Remember the original default outbound so uninstall can restore it.
-        jq -r '.route.final // empty' "$_f" >"$ETC/backup/$(printf '%s' "$_f" | tr / _).final" 2>/dev/null
-        jq --arg t "$NODE_TAG" --argjson p "$COMPAT_PORT" '
+        "$JQ_CMD" -r '.route.final // empty' "$_f" >"$ETC/backup/$(printf '%s' "$_f" | tr / _).final" 2>/dev/null
+        "$JQ_CMD" --arg t "$NODE_TAG" --argjson p "$COMPAT_PORT" '
           .outbounds = ([{type: "socks", tag: $t, server: "127.0.0.1", server_port: $p, version: "5"}] + (.outbounds // []))
           | if .route.final then .route.final = $t else . end' "$_f" >"$_f.geo" 2>/dev/null
       else
-        jq --arg t "$NODE_TAG" --argjson p "$COMPAT_PORT" '
+        "$JQ_CMD" --arg t "$NODE_TAG" --argjson p "$COMPAT_PORT" '
           .outbounds = ([{tag: $t, protocol: "socks", settings: {servers: [{address: "127.0.0.1", port: $p}]}}] + (.outbounds // []))' \
           "$_f" >"$_f.geo" 2>/dev/null
       fi
@@ -1031,7 +1091,7 @@ node_release() { # file
     *)
       ensure_jq || return 1
       _fin=$(cat "$ETC/backup/$(printf '%s' "$_f" | tr / _).final" 2>/dev/null)
-      jq --arg t "$NODE_TAG" --arg fin "$_fin" '(.outbounds |= map(select(.tag != $t)))
+      "$JQ_CMD" --arg t "$NODE_TAG" --arg fin "$_fin" '(.outbounds |= map(select(.tag != $t)))
         | if .route.final == $t then
             (if $fin == "" then del(.route.final) else .route.final = $fin end)
           else . end' "$_f" >"$_f.geo" 2>/dev/null &&
@@ -1369,7 +1429,7 @@ nx_scan() {
     case $_k in
       xray|sing-box)
         if ! ensure_jq; then
-          warn "需要 jq 才能读取 $_nf，自动安装失败，请手动安装 jq。"
+          warn "需要 jq 才能读取 $_nf，自动准备失败。请手动安装 jq（apt install jq）后再试。"
           continue
         fi
         if [ "$_k" = xray ]; then
@@ -1379,7 +1439,7 @@ nx_scan() {
         fi
         nx_set_files "$_nf" >"$ETC/.nxset"
         while IFS= read -r _x; do
-          if ! jq -r "$NX_JQ_DEFS fixtags | (.inbounds // [])[] | select(.tag != \"api\") | $_q | @tsv" \
+          if ! "$JQ_CMD" -r "$NX_JQ_DEFS fixtags | (.inbounds // [])[] | select(.tag != \"api\") | $_q | @tsv" \
             "$_x" >"$ETC/.nxone" 2>/dev/null; then
             NX_BAD="$NX_BAD $_x"
             continue
@@ -1585,7 +1645,7 @@ nx_apply() { # config
         [ -n "$_last" ] && _rf=$_last
       fi
       _blk=$(while IFS= read -r _x; do
-          jq -r '(.outbounds // [])[] | select(.protocol == "blackhole" or .type == "block") | .tag // empty' "$_x" 2>/dev/null
+          "$JQ_CMD" -r '(.outbounds // [])[] | select(.protocol == "blackhole" or .type == "block") | .tag // empty' "$_x" 2>/dev/null
         done <"$ETC/.nxfiles")
       _fail=
       while IFS= read -r _x; do
@@ -1593,17 +1653,17 @@ nx_apply() { # config
         [ "$_x" = "$_f" ] && _ob=1
         [ "$_x" = "$_rf" ] && _ru=1
         # Untagged inbounds only need a tag while this node has bindings.
-        [ -n "$_bl" ] && jq -e '[(.inbounds // [])[] | select((.tag // "") == "")] | length > 0' "$_x" >/dev/null 2>&1 && _tg=1
+        [ -n "$_bl" ] && "$JQ_CMD" -e '[(.inbounds // [])[] | select((.tag // "") == "")] | length > 0' "$_x" >/dev/null 2>&1 && _tg=1
         [ "$_ob$_ru$_tg" = 000 ] && ! grep -qs 'geo-x-' "$_x" && continue
         if ! GEO_NX_BINDS=$_bl GEO_NX_EXITS=$(cat "$EXITS" 2>/dev/null) GEO_NX_BLK=$_blk \
-          jq --arg kind "$_k" --arg ob "$_ob" --arg ru "$_ru" --arg tg "$_tg" \
+          "$JQ_CMD" --arg kind "$_k" --arg ob "$_ob" --arg ru "$_ru" --arg tg "$_tg" \
           "$NX_JQ_DEFS $NX_JQ" "$_x" >"$ETC/.nxout" 2>/dev/null || [ ! -s "$ETC/.nxout" ]; then
           _fail=$_x
           break
         fi
         # Write in place so the file keeps its owner and permissions; leave
         # files alone when nothing changes (jq would only re-indent them).
-        if [ "$(jq -cS . "$ETC/.nxout")" != "$(jq -cS . "$_x")" ]; then
+        if [ "$("$JQ_CMD" -cS . "$ETC/.nxout")" != "$("$JQ_CMD" -cS . "$_x")" ]; then
           cat "$ETC/.nxout" >"$_x"
         fi
       done <"$ETC/.nxfiles"
@@ -2492,7 +2552,7 @@ uninstall() {
     crontab -l 2>/dev/null | grep -v "$SELF boot" | crontab - 2>/dev/null
   fi
   for p in $(list_profiles); do rm -f "$BIN/$p"; done
-  rm -f "$BIN/geooff" "$GLIDER" "$LOG" "$PIDFILE" "$WATCH_PIDFILE"
+  rm -f "$BIN/geooff" "$GLIDER" "$JQ_BIN" "$LOG" "$PIDFILE" "$WATCH_PIDFILE"
   rm -rf "$ETC"
   if id "$RUN_USER" >/dev/null 2>&1; then
     if have userdel; then userdel "$RUN_USER" 2>/dev/null; elif have deluser; then deluser "$RUN_USER" 2>/dev/null; fi
@@ -2601,6 +2661,9 @@ first_install() {
 # ---------------------------------------------------------------- entry
 
 main() {
+  # Say why we stopped instead of a bare "Terminated" (small boxes kill big
+  # processes when memory runs out).
+  trap 'printf "\n" >&2; err "脚本被系统终止了，多半是内存不够。可以运行 free -m 看看剩余内存，关掉一些程序后重试。"; exit 143' TERM
   me=$(basename "$0")
   case $me in
     geooff)
