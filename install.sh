@@ -8,7 +8,7 @@
 #                    geooff         (back to this machine's own IP)
 
 # shellcheck disable=SC1007,SC1091,SC2015,SC2046,SC2154
-GEO_VERSION=2.1.1
+GEO_VERSION=3.0.0
 GLIDER_VERSION=0.16.4
 REPO_RAW=${GEO_REPO_RAW:-https://raw.githubusercontent.com/imthnio/vps-geo/main}
 # Prefix for GitHub downloads on machines that can't reach GitHub directly,
@@ -42,8 +42,12 @@ AUTO_PORT_MAX=1199
 if [ -t 1 ]; then
   C_R=$(printf '\033[31m') C_G=$(printf '\033[32m') C_Y=$(printf '\033[33m')
   C_B=$(printf '\033[36m') C_0=$(printf '\033[0m')
+  # bold + colour, for the things people must not miss
+  C_HG=$(printf '\033[1;32m') C_HY=$(printf '\033[1;33m') C_HR=$(printf '\033[1;31m')
+  C_HC=$(printf '\033[1;36m') C_HM=$(printf '\033[1;35m')
 else
   C_R= C_G= C_Y= C_B= C_0=
+  C_HG= C_HY= C_HR= C_HC= C_HM=
 fi
 
 say()  { printf '%s\n' "$*"; }
@@ -51,7 +55,12 @@ ok()   { printf '%s[✓]%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
 err()  { printf '%s[✗]%s %s\n' "$C_R" "$C_0" "$*" >&2; }
 die()  { err "$*"; exit 1; }
-title() { printf '\n%s==== %s ====%s\n' "$C_B" "$*" "$C_0"; }
+title() { printf '\n%s==== %s ====%s\n' "$C_HC" "$*" "$C_0"; }
+# Inline highlights: $(hg text) bold green, hy bold yellow, hr bold red, hm bold magenta
+hg() { printf '%s%s%s' "$C_HG" "$*" "$C_0"; }
+hy() { printf '%s%s%s' "$C_HY" "$*" "$C_0"; }
+hr() { printf '%s%s%s' "$C_HR" "$*" "$C_0"; }
+hm() { printf '%s%s%s' "$C_HM" "$*" "$C_0"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ask VAR "prompt" [default]
@@ -555,8 +564,8 @@ check_ip() {
 }
 
 print_ip() {
-  say "  出口 IP : $C_G$IP_ADDR$C_0"
-  [ -n "$IP_CC" ] && say "  国家    : $(country_name "$IP_CC") ($IP_CC)"
+  say "  出口 IP : $(hg "$IP_ADDR")"
+  [ -n "$IP_CC" ] && say "  国家    : $(hy "$(country_name "$IP_CC") ($IP_CC)")"
   [ -n "$IP_CITY" ] && say "  城市    : $IP_CITY"
   [ -n "$IP_ORG" ] && say "  网络    : $IP_ORG"
   return 0
@@ -674,7 +683,8 @@ fw_up() {
   load_profile "$(active_name)" || return 1
   load_ipt || return 1
   fw_down
-  ips=$(resolve_host "$(proxy_host "$PROXY")")
+  # Per-node exits (menu 2) are dialled directly by the nodes, not via glider.
+  ips=$( { resolve_host "$(proxy_host "$PROXY")"; nx_exit_ips; } | sort -u)
   owner=0
   $IPT -t nat -N $CHAIN || return 1
   for n in $V4_PRIVATE; do
@@ -752,6 +762,8 @@ NODE_CONFS="/etc/sing-box/config.json /usr/local/etc/sing-box/config.json
 /etc/hysteria/config.yaml /etc/hysteria/config.yml"
 # Configs found from running processes are remembered here ("config|binary").
 NODE_LIST=$ETC/nodes
+# Node configs the user added by hand (menu 3), same "config|binary" format.
+NODE_EXTRA=$ETC/nodes.extra
 
 node_is_proxy_bin() {
   case ${1##*/} in
@@ -793,6 +805,7 @@ node_all() {
   {
     node_discover
     cat "$NODE_LIST" 2>/dev/null
+    cat "$NODE_EXTRA" 2>/dev/null
     for _c in $NODE_CONFS; do echo "$_c|"; done
   } | awk -F'|' '$1 != "" && !seen[$1]++'
 }
@@ -911,6 +924,8 @@ node_inject() { # file [binary]
   node_skipped "$_f" && return 1
   _k=$(node_kind "$_f")
   [ -n "$_k" ] || return 1
+  # A hysteria node with its own exit (menu 2) keeps it.
+  [ "$_k" = hysteria ] && grep -qF "$NX_MARK" "$_f" && return 1
   mkdir -p "$ETC/backup"
   cp "$_f" "$ETC/backup/$(printf '%s' "$_f" | tr / _)"
   case $_k in
@@ -1024,6 +1039,686 @@ node_watch() {
   while :; do
     [ -f "$ETC/compat" ] && node_scan >/dev/null 2>&1
     sleep 20
+  done
+}
+
+# ---------------------------------------------------------------- per-node exits (menu 2 / 3)
+#
+# Every node (each inbound of xray / sing-box, or a whole hysteria2 config)
+# can get its own SOCKS5 exit. The node dials the exit itself: we add a socks
+# outbound "geo-x-<名字>" plus a routing rule "these inbounds -> that outbound"
+# to the node's config. Exits live in $EXITS, bindings in $BINDS; the node
+# configs are always regenerated from those two files.
+
+EXITS=$ETC/exits          # 名字<TAB>host<TAB>port<TAB>user<TAB>pass
+BINDS=$ETC/binds          # config<TAB>inbound-tag<TAB>名字   (hysteria: tag "*")
+NX_ROWS=$ETC/.nxrows      # config kind tag proto port binary  (last scan)
+NX_MARK="# geo-x: added by vps-geo"
+TAB=$(printf '\t')
+
+# jq helpers shared by the scan and the rewrite. Inbounds without a tag get
+# one (geo-in-<port>) so routing rules can point at them.
+NX_JQ_DEFS='
+def fixtags:
+  if (.inbounds | type) == "array" then
+    .inbounds |= (reduce range(0; length) as $i (.;
+      if (.[$i].tag // "") == "" then
+        ("geo-in-" + ((.[$i].port // .[$i].listen_port // $i) | tostring)) as $c
+        | .[$i].tag = (if any(.[]; .tag == $c) then $c + "-" + ($i | tostring) else $c end)
+      else . end))
+  else . end;
+def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+def isgeo: startswith("geo-x-");
+'
+
+# Rewrite one xray / sing-box config from $binds ("tag<TAB>名字" lines) and
+# $exits. Our rules go first, after any leading block / sniff-type rules,
+# so they win over the node's own routing but keep its ad / private blocks.
+NX_JQ='
+fixtags
+| rows($binds) as $b
+| rows($exits) as $e
+| [$b[] | .[1]] as $used
+| [$e[] | select(.[0] as $l | any($used[]; . == $l))] as $ue
+| (.outbounds // []) as $ob
+| if $kind == "xray" then
+    [$ob[] | select(.protocol == "blackhole") | .tag // empty] as $blk
+    | .outbounds = ([$ob[] | select((.tag // "") | isgeo | not)]
+        + [$ue[] | {tag: ("geo-x-" + .[0]), protocol: "socks",
+            settings: {servers: [{address: .[1], port: (.[2] | tonumber)}
+              + (if .[3] != "" then {users: [{user: .[3], pass: .[4]}]} else {} end)]}}])
+    | [$ue[] | .[0] as $l | {type: "field", inboundTag: [$b[] | select(.[1] == $l) | .[0]], outboundTag: ("geo-x-" + $l)}] as $mine
+    | [(.routing.rules // [])[] | select((.outboundTag // "") | isgeo | not)] as $r
+    | ([range(0; $r | length) | select(($r[.].outboundTag // "") as $t | any($blk[]; . == $t) | not)] | .[0] // ($r | length)) as $n
+    | if ($r | length) == 0 and ($mine | length) == 0 then .
+      else .routing = ((.routing // {}) + {rules: ($r[0:$n] + $mine + $r[$n:])}) end
+  else
+    [$ob[] | select(.type == "block") | .tag // empty] as $blk
+    | .outbounds = ([$ob[] | select((.tag // "") | isgeo | not)]
+        + [$ue[] | {type: "socks", tag: ("geo-x-" + .[0]), server: .[1], server_port: (.[2] | tonumber), version: "5"}
+            + (if .[3] != "" then {username: .[3], password: .[4]} else {} end)])
+    | [$ue[] | .[0] as $l | {inbound: [$b[] | select(.[1] == $l) | .[0]], outbound: ("geo-x-" + $l)}] as $mine
+    | [(.route.rules // [])[] | select((.outbound // "") | isgeo | not)] as $r
+    | ([range(0; $r | length) | select($r[.] as $x | ((($x.action // "route") != "route")
+          or (($x.outbound // "") as $t | any($blk[]; . == $t))) | not)] | .[0] // ($r | length)) as $n
+    | if ($r | length) == 0 and ($mine | length) == 0 then .
+      else .route = ((.route // {}) + {rules: ($r[0:$n] + $mine + $r[$n:])}) end
+  end
+'
+
+nx_valid_label() {
+  case $1 in *geo-out*) return 1 ;; esac
+  printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+}
+
+# parse_exit "socks5://user:pass@host:port#名字"
+#   -> E_LABEL E_HOST E_PORT E_USER E_PASS
+# The part after the last # is the name; without one the user name is used.
+parse_exit() {
+  _pe=$(printf '%s' "$1" | tr -d ' \t\r')
+  E_LABEL=
+  case $_pe in *'#'*) E_LABEL=${_pe##*#}; _pe=${_pe%#*} ;; esac
+  parse_proxy "$_pe" || return 1
+  E_HOST=$(printf '%s' "$P_HOST" | tr -d '[]')
+  E_PORT=$P_PORT E_USER=$P_USER E_PASS=$P_PASS
+  if [ -z "$E_LABEL" ]; then
+    E_LABEL=$(printf '%s' "${E_USER:-$E_HOST-$E_PORT}" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-32)
+    case $E_LABEL in [A-Za-z0-9]*) ;; *) E_LABEL=x$E_LABEL ;; esac
+  fi
+  return 0
+}
+
+# Line of an exit by name -> E_*; 1 if there is none.
+nx_exit_get() {
+  _el=$(awk -F'\t' -v l="$1" '$1 == l {print; exit}' "$EXITS" 2>/dev/null)
+  [ -n "$_el" ] || return 1
+  E_LABEL=$1
+  E_HOST=$(printf '%s\n' "$_el" | cut -f2)
+  E_PORT=$(printf '%s\n' "$_el" | cut -f3)
+  E_USER=$(printf '%s\n' "$_el" | cut -f4)
+  E_PASS=$(printf '%s\n' "$_el" | cut -f5)
+}
+
+nx_exit_put() { # 名字 host port user pass
+  umask 077
+  touch "$EXITS"
+  L=$1 LINE=$(printf '%s\t%s\t%s\t%s\t%s' "$@") awk -F'\t' '
+    $1 == ENVIRON["L"] {print ENVIRON["LINE"]; f = 1; next} {print}
+    END {if (!f) print ENVIRON["LINE"]}' "$EXITS" >"$EXITS.new" &&
+    mv "$EXITS.new" "$EXITS"
+  chmod 600 "$EXITS"
+}
+
+nx_exit_labels() { cut -f1 "$EXITS" 2>/dev/null; }
+nx_exit_count() { nx_exit_labels | grep -c . ; }
+
+# Every exit host's addresses, so whole-machine mode lets nodes reach them directly.
+nx_exit_ips() {
+  cut -f2 "$EXITS" 2>/dev/null | sort -u | while read -r _h; do
+    [ -n "$_h" ] && resolve_host "$_h"
+  done
+}
+
+# curl URL for the exit loaded in E_*
+nx_exit_curl() {
+  _h=$E_HOST
+  case $_h in *:*) _h="[$_h]" ;; esac
+  if [ -n "$E_USER" ]; then
+    printf 'socks5h://%s:%s@%s:%s' "$(urlenc "$E_USER")" "$(urlenc "$E_PASS")" "$_h" "$E_PORT"
+  else
+    printf 'socks5h://%s:%s' "$_h" "$E_PORT"
+  fi
+}
+
+# What to show for the exit in E_* (password hidden).
+nx_exit_text() {
+  if [ -n "$E_USER" ]; then
+    printf 'socks5://%s:****@%s:%s' "$E_USER" "$E_HOST" "$E_PORT"
+  else
+    printf 'socks5://%s:%s' "$E_HOST" "$E_PORT"
+  fi
+}
+
+nx_exit_test() { # uses E_*; prints one line
+  if check_ip -x "$(nx_exit_curl)"; then
+    say "    $(hg ✓) 出口 IP $(hg "$IP_ADDR")  $(hy "$(country_name "$IP_CC")")${IP_CITY:+ $IP_CITY}${IP_ORG:+  $IP_ORG}"
+    return 0
+  fi
+  say "    $(hr ✗) 连不上（地址、端口、账号或密码可能有误，或出口暂时不通）"
+  return 1
+}
+
+nx_users_of() { # 名字 -> how many nodes use it
+  awk -F'\t' -v l="$1" '$3 == l' "$BINDS" 2>/dev/null | grep -c .
+}
+
+nx_files_of() { # 名字 -> configs that use it
+  awk -F'\t' -v l="$1" '$3 == l {print $1}' "$BINDS" 2>/dev/null | sort -u
+}
+
+nx_bind_of() { # config tag -> 名字
+  F=$1 T=$2 awk -F'\t' '$1 == ENVIRON["F"] && $2 == ENVIRON["T"] {print $3; exit}' "$BINDS" 2>/dev/null
+}
+
+nx_bind() { # config tag [名字]   (no 名字 = unbind)
+  umask 077
+  touch "$BINDS"
+  F=$1 T=$2 awk -F'\t' '!($1 == ENVIRON["F"] && $2 == ENVIRON["T"])' "$BINDS" >"$BINDS.new"
+  [ -n "${3:-}" ] && printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$BINDS.new"
+  mv "$BINDS.new" "$BINDS"
+}
+
+# Panels regenerate the config themselves, so edits there would not stick.
+nx_is_panel() {
+  case $1 in
+    *x-ui*|*3x-ui*|*/s-ui/*|*marzban*|*hiddify*|*v2board*|*xboard*) return 0 ;;
+  esac
+  return 1
+}
+
+# Add one exit from a pasted line. Sets NX_ADDED to its name.
+nx_exit_add_line() { # line
+  NX_ADDED=
+  if ! parse_exit "$1"; then
+    err "格式不对: $1"
+    say "  正确写法: $(hy 'socks5://用户名:密码@主机:端口#名字')"
+    return 1
+  fi
+  if ! nx_valid_label "$E_LABEL"; then
+    err "名字 $E_LABEL 不行：1-32 位字母、数字、. _ -，字母或数字开头。"
+    return 1
+  fi
+  _nl=$E_LABEL _nh=$E_HOST _np=$E_PORT _nu=$E_USER _npw=$E_PASS
+  _changed=0
+  if nx_exit_get "$_nl"; then
+    if [ "$E_HOST|$E_PORT|$E_USER|$E_PASS" = "$_nh|$_np|$_nu|$_npw" ]; then
+      say "  出口 $(hg "$_nl") 已经在列表里了。"
+      NX_ADDED=$_nl
+      return 0
+    fi
+    confirm "  出口 $(hy "$_nl") 已存在（$(nx_exit_text)），要换成新地址吗？" y || return 1
+    _changed=1
+  fi
+  E_LABEL=$_nl E_HOST=$_nh E_PORT=$_np E_USER=$_nu E_PASS=$_npw
+  say "  正在检测 $(hm "$_nl")（$(nx_exit_text)）..."
+  nx_exit_test || warn "先照样保存。节点用它之前，请确认这个出口能连通。"
+  nx_exit_put "$_nl" "$_nh" "$_np" "$_nu" "$_npw"
+  ok "已保存出口 $(hg "$_nl")"
+  NX_ADDED=$_nl
+  if [ "$_changed" = 1 ]; then
+    for _f in $(nx_files_of "$_nl"); do nx_apply "$_f"; done
+  fi
+  nx_fw_refresh
+  return 0
+}
+
+# Whole-machine NAT mode must let nodes reach new exits directly.
+nx_fw_refresh() {
+  [ "$(cur_state)" = nat ] && fw_up >/dev/null 2>&1
+  return 0
+}
+
+# Find every node: one row per xray / sing-box inbound, one per hysteria config.
+nx_scan() {
+  : >"$NX_ROWS"
+  NX_BAD=
+  node_all >"$ETC/.nxall"
+  while IFS='|' read -r _nf _nx; do
+    [ -f "$_nf" ] || continue
+    _k=$(node_kind "$_nf")
+    [ -n "$_nx" ] || _nx=-
+    case $_k in
+      xray|sing-box)
+        if ! ensure_jq; then
+          warn "需要 jq 才能读取 $_nf，自动安装失败，请手动安装 jq。"
+          continue
+        fi
+        if [ "$_k" = xray ]; then
+          _q='[.tag, (.protocol // "?"), ((.port // "-") | tostring)]'
+        else
+          _q='[.tag, (.type // "?"), ((.listen_port // "-") | tostring)]'
+        fi
+        if ! jq -r "$NX_JQ_DEFS fixtags | (.inbounds // [])[] | select(.tag != \"api\") | $_q | @tsv" \
+          "$_nf" >"$ETC/.nxone" 2>/dev/null; then
+          NX_BAD="$NX_BAD $_nf"
+          continue
+        fi
+        while IFS="$TAB" read -r _t _p _po; do
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$_nf" "$_k" "$_t" "$_p" "${_po:--}" "$_nx"
+        done <"$ETC/.nxone" >>"$NX_ROWS"
+        ;;
+      hysteria)
+        _po=$(sed -n 's/^listen:.*:\([0-9][0-9]*\).*/\1/p' "$_nf" | head -n 1)
+        printf '%s\t%s\t*\thysteria2\t%s\t%s\n' "$_nf" "$_k" "${_po:--}" "$_nx" >>"$NX_ROWS"
+        ;;
+    esac
+  done <"$ETC/.nxall"
+  rm -f "$ETC/.nxall" "$ETC/.nxone"
+}
+
+nx_row() { # n -> R_FILE R_KIND R_TAG R_PROTO R_PORT R_BIN
+  _rl=$(sed -n "${1}p" "$NX_ROWS")
+  [ -n "$_rl" ] || return 1
+  R_FILE=$(printf '%s\n' "$_rl" | cut -f1)
+  R_KIND=$(printf '%s\n' "$_rl" | cut -f2)
+  R_TAG=$(printf '%s\n' "$_rl" | cut -f3)
+  R_PROTO=$(printf '%s\n' "$_rl" | cut -f4)
+  R_PORT=$(printf '%s\n' "$_rl" | cut -f5)
+  R_BIN=$(printf '%s\n' "$_rl" | cut -f6)
+}
+
+nx_row_count() {
+  [ -f "$NX_ROWS" ] || { echo 0; return 0; }
+  grep -c . "$NX_ROWS"
+}
+
+# Print the scanned nodes with their exits.
+nx_show_nodes() {
+  _run=$(node_discover | cut -d'|' -f1)
+  _cnt=$(nx_row_count)
+  if [ "$_cnt" -eq 0 ]; then
+    warn "没找到节点。"
+    say "  支持 xray / v2ray / sing-box / hysteria2。节点要正在运行，或者配置在常见位置。"
+    say "  配置放在别处的话，到 $(hy '菜单 3 → 手动添加节点配置文件') 里填上路径。"
+  fi
+  _last=
+  _i=0
+  while [ "$_i" -lt "$_cnt" ]; do
+    _i=$((_i + 1))
+    nx_row "$_i"
+    if [ "$R_FILE" != "$_last" ]; then
+      _last=$R_FILE
+      _st="$(hr 未运行)"
+      printf '%s\n' "$_run" | grep -qxF "$R_FILE" && _st="$(hg 运行中)"
+      nx_is_panel "$R_FILE" && _st="$_st $(hy '面板管理，不能在这里改')"
+      say ""
+      say "  $(hc_kind "$R_KIND")  $R_FILE  [$_st]"
+    fi
+    _lab=$(nx_bind_of "$R_FILE" "$R_TAG")
+    if [ -z "$_lab" ]; then
+      _ex="默认出站"
+      [ -f "$ETC/compat" ] && grep -qs "$NODE_TAG" "$R_FILE" && _ex="默认（菜单 1 的整机出口）"
+    elif ! nx_exit_get "$_lab"; then
+      _ex="$(hr "$_lab（出口已不存在）")"
+    elif grep -qsF "geo-x-$_lab" "$R_FILE"; then
+      _ex="$(hg "→ $_lab")  $(nx_exit_text)"
+    else
+      _ex="$(hy "→ $_lab（未生效，节点配置被改过，输入 r 重新应用）")"
+    fi
+    _tg=$R_TAG
+    [ "$_tg" = "*" ] && _tg="整个节点"
+    printf '  %s%3s)%s %-12s 端口 %s%-6s%s 标签 %-16s 出口: %s\n' \
+      "$C_HC" "$_i" "$C_0" "$R_PROTO" "$C_HY" "$R_PORT" "$C_0" "$_tg" "$_ex"
+  done
+  for _b in $NX_BAD; do
+    warn "读不了 $_b（不是标准 JSON，可能带注释），跳过。"
+  done
+}
+
+hc_kind() { printf '%s[%s]%s' "$C_HM" "$1" "$C_0"; }
+
+# Print the exit list, numbered.
+nx_show_exits() {
+  _n=0
+  for _l in $(nx_exit_labels); do
+    _n=$((_n + 1))
+    nx_exit_get "$_l"
+    say "  $C_HC$(printf '%3s' "$_n"))$C_0 $(hg "$_l")    $(nx_exit_text)    $(nx_users_of "$_l") 个节点在用"
+  done
+  [ "$_n" -gt 0 ] || say "  （出口列表是空的）"
+}
+
+# Resolve the user's answer to an exit: number / name / pasted URL.
+# Sets NX_PICK (name); NX_PICK=- means "remove the exit"; 1 = cancelled.
+nx_pick_exit() { # answer
+  NX_PICK=
+  case $1 in
+    '') return 1 ;;
+    0|d|D|del|直连|解除) NX_PICK=-; return 0 ;;
+    *@*|*://*|*:*:*) nx_exit_add_line "$1" || return 1; NX_PICK=$NX_ADDED; return 0 ;;
+    *[!0-9]*) nx_exit_get "$1" && { NX_PICK=$1; return 0; } ;;
+    *) NX_PICK=$(nx_exit_labels | sed -n "${1}p"); [ -n "$NX_PICK" ] && return 0 ;;
+  esac
+  err "没有这个出口: $1"
+  return 1
+}
+
+# Parse "1 3 5" / "1,3" / "2-6" / "a" into NX_SEL (row numbers).
+nx_pick_rows() { # answer
+  NX_SEL=
+  _cnt=$(nx_row_count)
+  case $1 in
+    a|A|all|全部) NX_SEL=$(awk -v n="$_cnt" 'BEGIN {for (i = 1; i <= n; i++) printf "%d ", i}'); return 0 ;;
+  esac
+  for _tok in $(printf '%s' "$1" | tr ',' ' '); do
+    case $_tok in
+      *[!0-9-]*|-*|*-) err "看不懂: $_tok"; return 1 ;;
+      *-*) _a=${_tok%-*} _b=${_tok#*-} ;;
+      *) _a=$_tok _b=$_tok ;;
+    esac
+    if [ "$_a" -lt 1 ] || [ "$_b" -gt "$_cnt" ] || [ "$_a" -gt "$_b" ]; then
+      err "序号超出范围: $_tok（共 $_cnt 个）"
+      return 1
+    fi
+    while [ "$_a" -le "$_b" ]; do NX_SEL="$NX_SEL $_a"; _a=$((_a + 1)); done
+  done
+  [ -n "$NX_SEL" ]
+}
+
+yaml_q() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+
+# Remove a block we appended to a YAML file (from its marker line to the end).
+yaml_drop() { # file marker
+  grep -qF "$2" "$1" || return 0
+  M=$2 awk 'index($0, ENVIRON["M"]) == 1 {exit}
+    $0 == "" {b = b "\n"; next} {printf "%s", b; b = ""; print}' "$1" >"$1.geo" &&
+    [ -s "$1.geo" ] && cat "$1.geo" >"$1"
+  rm -f "$1.geo"
+}
+
+# Rewrite one node config from $BINDS, check it, restart the node.
+nx_apply() { # config
+  _f=$1
+  _k=$(node_kind "$_f")
+  _bin=$(node_all | awk -F'|' -v f="$_f" '$1 == f {print $2; exit}')
+  if nx_is_panel "$_f"; then
+    err "$_f 由面板管理，面板会重写配置，请在面板里添加 socks 出站和路由规则。"
+    return 1
+  fi
+  mkdir -p "$ETC/backup-x"
+  # The very first original stays as a safety copy.
+  _orig=$ETC/backup-x/$(printf '%s' "$_f" | tr / _)
+  [ -f "$_orig" ] || cp "$_f" "$_orig"
+  cp "$_f" "$ETC/.nxprev"
+  _bl=$(F=$_f awk -F'\t' '$1 == ENVIRON["F"] {print $2 "\t" $3}' "$BINDS" 2>/dev/null)
+  case $_k in
+    xray|sing-box)
+      ensure_jq || { err "装不上 jq，没法修改节点配置。"; return 1; }
+      if ! jq --arg kind "$_k" --arg binds "$_bl" --arg exits "$(cat "$EXITS" 2>/dev/null)" \
+        "$NX_JQ_DEFS $NX_JQ" "$_f" >"$_f.geo" 2>/dev/null || [ ! -s "$_f.geo" ]; then
+        rm -f "$_f.geo" "$ETC/.nxprev"
+        err "$_f 不是标准 JSON（可能带注释），没法自动修改。"
+        return 1
+      fi
+      # Write in place so the file keeps its owner and permissions.
+      cat "$_f.geo" >"$_f"
+      rm -f "$_f.geo"
+      ;;
+    hysteria)
+      _lab=$(printf '%s\n' "$_bl" | awk -F'\t' 'NF {print $2; exit}')
+      yaml_drop "$_f" "$NX_MARK"
+      if [ -n "$_lab" ]; then
+        # Menu 1's takeover block gives way to the node's own exit.
+        yaml_drop "$_f" "# $NODE_TAG: added by vps-geo"
+        if grep -q '^outbounds:' "$_f"; then
+          cat "$ETC/.nxprev" >"$_f"
+          rm -f "$ETC/.nxprev"
+          err "$_f 里已经有自己的 outbounds，请手动添加 socks5 出站。"
+          return 1
+        fi
+        nx_exit_get "$_lab" || { cat "$ETC/.nxprev" >"$_f"; err "出口 $_lab 不存在。"; return 1; }
+        _addr=$E_HOST
+        case $_addr in *:*) _addr="[$_addr]" ;; esac
+        {
+          printf '\n%s (%s)\noutbounds:\n  - name: geo-x-%s\n    type: socks5\n    socks5:\n      addr: %s\n' \
+            "$NX_MARK" "$_lab" "$_lab" "$(yaml_q "$_addr:$E_PORT")"
+          [ -n "$E_USER" ] && printf '      username: %s\n      password: %s\n' "$(yaml_q "$E_USER")" "$(yaml_q "$E_PASS")"
+        } >>"$_f"
+      fi
+      ;;
+    *)
+      rm -f "$ETC/.nxprev"
+      err "认不出 $_f 是哪种节点配置。"
+      return 1
+      ;;
+  esac
+  if cmp -s "$_f" "$ETC/.nxprev"; then
+    rm -f "$ETC/.nxprev"
+    return 0
+  fi
+  [ "$_bin" = - ] && _bin=
+  if ! node_test "$_k" "$_f" "$_bin"; then
+    cat "$ETC/.nxprev" >"$_f"
+    rm -f "$ETC/.nxprev"
+    err "改完后 $_k 自检不通过，已把 $_f 还原。"
+    return 1
+  fi
+  rm -f "$ETC/.nxprev"
+  if node_restart "$_f" "$_k"; then
+    ok "已更新并重启 $_k 节点（$_f）"
+  else
+    warn "已改好 $_f，但没能自动重启，请$(hy 手动重启一次节点)。"
+  fi
+  return 0
+}
+
+nx_apply_all() {
+  for _f in $(cut -f1 "$BINDS" 2>/dev/null | sort -u); do
+    [ -f "$_f" ] && nx_apply "$_f"
+  done
+}
+
+# Uninstall: take every per-node exit out of the node configs.
+nx_release_all() {
+  [ -s "$BINDS" ] || return 0
+  _fs=$(cut -f1 "$BINDS" | sort -u)
+  : >"$BINDS"
+  for _f in $_fs; do
+    [ -f "$_f" ] && nx_apply "$_f"
+  done
+}
+
+# ---- menu 2: detect nodes, give each one an exit
+nx_assign() {
+  while :; do
+    title "节点出口分流：给每个节点填出口 IP"
+    say "正在检测本机的节点..."
+    nx_scan
+    nx_show_nodes
+    _cnt=$(nx_row_count)
+    [ "$_cnt" -gt 0 ] || return 0
+    say ""
+    say "选节点: 输入$(hy 序号)，多个用空格隔开（如 $(hy '1 3') 或 $(hy 2-5)），$(hy a) = 全部"
+    say "        $(hy r) = 重新应用全部出口设置，直接回车返回"
+    ask in_nodes "选择节点"
+    case $in_nodes in
+      '') return 0 ;;
+      r|R) nx_apply_all; continue ;;
+    esac
+    nx_pick_rows "$in_nodes" || continue
+
+    title "给选中的节点填出口"
+    for _s in $NX_SEL; do
+      nx_row "$_s"
+      say "  $(hc_kind "$R_KIND") $R_PROTO 端口 $(hy "$R_PORT")  标签 $R_TAG"
+    done
+    say ""
+    say "已有的出口:"
+    nx_show_exits
+    say ""
+    say "填出口: 输入上面的$(hy 序号)或$(hy 名字)，或者直接粘贴新的出口，例如"
+    say "        $(hg 'socks5://user-nl:globe-server-nl@10.91.0.1:8080#user-nl')"
+    say "        （# 后面是这个出口的名字；输入 $(hy 0) = 去掉出口，恢复节点原来的出站）"
+    ask in_exit "出口"
+    nx_pick_exit "$in_exit" || continue
+
+    _files=
+    for _s in $NX_SEL; do
+      nx_row "$_s"
+      if nx_is_panel "$R_FILE"; then
+        warn "跳过面板管理的节点 $R_FILE"
+        continue
+      fi
+      if [ "$NX_PICK" = - ]; then nx_bind "$R_FILE" "$R_TAG"; else nx_bind "$R_FILE" "$R_TAG" "$NX_PICK"; fi
+      case " $_files " in *" $R_FILE "*) ;; *) _files="$_files $R_FILE" ;; esac
+    done
+    _okc=0
+    for _f in $_files; do
+      nx_apply "$_f" && _okc=$((_okc + 1))
+    done
+    if [ "$NX_PICK" = - ]; then
+      ok "已去掉选中节点的出口。"
+    elif [ "$_okc" -gt 0 ]; then
+      ok "选中的节点现在从 $(hg "$NX_PICK") 出去。"
+      say "  $(hy 提示)：客户端连节点时，地址还是填$(hg 本机 IP)，不是出口 IP。"
+    fi
+  done
+}
+
+# ---- menu 3: manage nodes and exits
+nx_add_exits() {
+  title "添加出口"
+  say "格式: $(hg 'socks5://用户名:密码@主机:端口#名字')    例如:"
+  say "      $(hg 'socks5://user-nl:globe-server-nl@10.91.0.1:8080#user-nl')"
+  say "可以$(hy 一次粘贴多行)，每行一个；粘贴完$(hy 再按一次回车)结束。"
+  _added=0
+  while :; do
+    ask in_line "出口"
+    [ -n "$in_line" ] || break
+    nx_exit_add_line "$in_line" && _added=$((_added + 1))
+    [ -n "${GEO_ASK_in_line:-}" ] && break
+  done
+  [ "$_added" -gt 0 ] && ok "这次保存了 $(hg "$_added") 个出口。去 $(hy '菜单 2') 把它们分给节点。"
+  return 0
+}
+
+nx_pick_exit_existing() { # prompt -> NX_PICK
+  NX_PICK=
+  [ "$(nx_exit_count)" -gt 0 ] || { say "  （出口列表是空的）"; return 1; }
+  nx_show_exits
+  ask in_ex "$1（序号或名字，回车取消）"
+  [ -n "$in_ex" ] || return 1
+  case $in_ex in
+    *[!0-9]*) NX_PICK=$in_ex ;;
+    *) NX_PICK=$(nx_exit_labels | sed -n "${in_ex}p") ;;
+  esac
+  [ -n "$NX_PICK" ] && nx_exit_get "$NX_PICK" || { err "没有这个出口。"; return 1; }
+}
+
+nx_test_exits() {
+  title "检测全部出口"
+  [ "$(nx_exit_count)" -gt 0 ] || { say "  （出口列表是空的）"; return 0; }
+  _good=0 _bad=0
+  for _l in $(nx_exit_labels); do
+    nx_exit_get "$_l"
+    say "  $(hg "$_l")  $(nx_exit_text)"
+    if nx_exit_test; then _good=$((_good + 1)); else _bad=$((_bad + 1)); fi
+  done
+  say ""
+  say "  结果: $(hg "$_good 个可用")，$( [ "$_bad" -gt 0 ] && hr "$_bad 个不通" || printf '0 个不通')"
+}
+
+nx_edit_exit() {
+  title "修改出口"
+  nx_pick_exit_existing "要修改哪个出口" || return 0
+  _old=$NX_PICK
+  say "粘贴 $(hg "$_old") 的新地址（名字保持 $_old 不变）:"
+  ask in_line "新地址"
+  [ -n "$in_line" ] || return 0
+  _base=$(printf '%s' "$in_line" | tr -d ' \t\r')
+  case $_base in *'#'*) _base=${_base%#*} ;; esac
+  nx_exit_add_line "$_base#$_old"
+}
+
+nx_del_exit() {
+  title "删除出口"
+  nx_pick_exit_existing "要删除哪个出口" || return 0
+  _dl=$NX_PICK
+  _u=$(nx_users_of "$_dl")
+  [ "$_u" -gt 0 ] && warn "有 $_u 个节点在用 $_dl，删除后它们恢复原来的出站。"
+  confirm "确定删除出口 $(hr "$_dl") 吗？" n || return 0
+  _fs=$(nx_files_of "$_dl")
+  awk -F'\t' -v l="$_dl" '$3 != l' "$BINDS" >"$BINDS.new" 2>/dev/null && mv "$BINDS.new" "$BINDS"
+  awk -F'\t' -v l="$_dl" '$1 != l' "$EXITS" >"$EXITS.new" && mv "$EXITS.new" "$EXITS"
+  chmod 600 "$EXITS" "$BINDS" 2>/dev/null
+  for _f in $_fs; do [ -f "$_f" ] && nx_apply "$_f"; done
+  nx_fw_refresh
+  ok "已删除出口 $_dl"
+}
+
+nx_unbind() {
+  title "去掉节点出口"
+  nx_scan
+  nx_show_nodes
+  [ "$(nx_row_count)" -gt 0 ] || return 0
+  say ""
+  ask in_nodes "去掉哪些节点的出口（序号，多个空格隔开，a=全部，回车取消）"
+  [ -n "$in_nodes" ] || return 0
+  nx_pick_rows "$in_nodes" || return 0
+  _files=
+  for _s in $NX_SEL; do
+    nx_row "$_s"
+    [ -n "$(nx_bind_of "$R_FILE" "$R_TAG")" ] || continue
+    nx_bind "$R_FILE" "$R_TAG"
+    case " $_files " in *" $R_FILE "*) ;; *) _files="$_files $R_FILE" ;; esac
+  done
+  [ -n "$_files" ] || { say "选中的节点本来就没有设置出口。"; return 0; }
+  for _f in $_files; do nx_apply "$_f"; done
+  ok "已恢复选中节点原来的出站。"
+}
+
+nx_add_node_path() {
+  title "手动添加节点配置文件"
+  say "自动找不到节点时用：填节点的配置文件路径（xray / sing-box 的 json，或 hysteria2 的 yaml）。"
+  ask in_path "配置文件路径（回车取消）"
+  [ -n "$in_path" ] || return 0
+  [ -f "$in_path" ] || { err "文件不存在: $in_path"; return 1; }
+  [ -n "$(node_kind "$in_path")" ] || { err "认不出这是哪种节点配置: $in_path"; return 1; }
+  grep -qsF "$in_path|" "$NODE_EXTRA" || echo "$in_path|" >>"$NODE_EXTRA"
+  ok "已添加 $(hg "$in_path")（$(node_kind "$in_path")）"
+}
+
+nx_del_node_path() {
+  title "移除手动添加的节点配置文件"
+  [ -s "$NODE_EXTRA" ] || { say "  没有手动添加过。"; return 0; }
+  _n=0
+  while IFS='|' read -r _p _x; do
+    _n=$((_n + 1))
+    say "  $_n) $_p"
+  done <"$NODE_EXTRA"
+  ask in_pick "要移除哪个（序号，回车取消）"
+  case $in_pick in ''|*[!0-9]*) return 0 ;; esac
+  _p=$(sed -n "${in_pick}p" "$NODE_EXTRA" | cut -d'|' -f1)
+  [ -n "$_p" ] || return 0
+  if [ -n "$(F=$_p awk -F'\t' '$1 == ENVIRON["F"]' "$BINDS" 2>/dev/null)" ]; then
+    F=$_p awk -F'\t' '$1 != ENVIRON["F"]' "$BINDS" >"$BINDS.new" && mv "$BINDS.new" "$BINDS"
+    [ -f "$_p" ] && nx_apply "$_p"
+  fi
+  sed "${in_pick}d" "$NODE_EXTRA" >"$NODE_EXTRA.new" && mv "$NODE_EXTRA.new" "$NODE_EXTRA"
+  ok "已移除 $_p"
+}
+
+nx_manage() {
+  while :; do
+    title "节点管理 / 出口管理"
+    say "  共 $(hg "$(nx_exit_count) 个出口")，$(hg "$(cut -f1,2 "$BINDS" 2>/dev/null | grep -c .) 个节点")设置了出口"
+    say ""
+    say "  $(hm 节点)"
+    say "  1) 查看所有节点和它们的出口"
+    say "  2) 去掉节点出口（恢复节点原来的出站）"
+    say "  3) 手动添加节点配置文件（自动找不到节点时用）"
+    say "  4) 移除手动添加的节点配置文件"
+    say "  $(hm 出口)"
+    say "  5) 查看出口列表"
+    say "  6) 检测全部出口（出口 IP / 国家 / 是否可用）"
+    say "  7) 添加出口（可一次粘贴多行）"
+    say "  8) 修改出口地址（用到它的节点自动更新）"
+    say "  9) 删除出口（用到它的节点自动恢复）"
+    say "  0) 返回"
+    ask in_m3 "请选择" 0
+    case $in_m3 in
+      1) title "节点和出口"; nx_scan; nx_show_nodes ;;
+      2) nx_unbind ;;
+      3) nx_add_node_path ;;
+      4) nx_del_node_path ;;
+      5) title "出口列表"; nx_show_exits ;;
+      6) nx_test_exits ;;
+      7) nx_add_exits ;;
+      8) nx_edit_exit ;;
+      9) nx_del_exit ;;
+      0|q) return 0 ;;
+      *) err "请输入菜单里的数字。" ;;
+    esac
   done
 }
 
@@ -1388,7 +2083,7 @@ use_profile() {
     fi
     return 1
   fi
-  ok "已切换到 $NAME"
+  ok "已切换到 $(hg "$NAME")"
   print_ip
   _real=$(real_ip)
   case $_st in
@@ -1396,7 +2091,7 @@ use_profile() {
       say ""
       say "  这台机器访问外网都会用上面的出口 IP，节点也一样，不用改节点配置。"
       if [ -n "$_real" ]; then
-        say "  ${C_Y}搭节点注意${C_0}：节点地址要填本机 IP ${C_G}$_real${C_0}，不是上面的出口 IP。"
+        say "  $(hy 搭节点注意)：节点地址要填本机 IP $(hg "$_real")，$(hr 不是上面的出口 IP)。"
         say "  搭节点脚本自动检测到的 IP 如果不是 $_real，请手动改成 $_real。"
       fi
       ;;
@@ -1438,7 +2133,7 @@ turn_off() {
 show_status() {
   title "当前状态"
   _real=$(real_ip)
-  [ -n "$_real" ] && say "本机 IP（搭节点填这个）: $_real"
+  [ -n "$_real" ] && say "本机 IP（搭节点填这个）: $(hg "$_real")"
   a=$(active_name)
   if [ -z "$a" ] || ! load_profile "$a"; then
     say "当前出口: 直连（没有使用任何出口）"
@@ -1451,7 +2146,7 @@ show_status() {
     compat) _how="整机（节点接管）" ;;
     *) _how="端口 127.0.0.1:$PORT" ;;
   esac
-  say "当前出口: $C_G$a$C_0（$_how）"
+  say "当前出口: $(hg "$a")（$_how）"
   if [ "$_st" = compat ]; then
     _nodes=$(node_taken)
     say "已接管节点:${_nodes:- 还没有（装好节点后 20 秒内自动接管）}"
@@ -1593,6 +2288,7 @@ del_profile() { # name
 }
 
 uninstall() {
+  nx_release_all
   node_release_all
   rm -f "$ACTIVE" "$ETC/compat"
   svc_stop_all
@@ -1612,14 +2308,15 @@ uninstall() {
   ok "已卸载，本机恢复直连。"
 }
 
-menu() {
+# ---- menu 1: whole-machine exit (the original geous / geooff feature)
+menu_exit() {
   while :; do
-    title "vps-geo 出口管理 v$GEO_VERSION"
+    title "整机出口切换（geous / geooff）"
     a=$(active_name)
     if [ -n "$a" ] && load_profile "$a"; then
-      say "当前: $C_G$a$C_0（$(mode_text "$MODE" "$PORT")）"
+      say "当前: $(hg "$a")（$(mode_text "$MODE" "$PORT")）"
     else
-      say "当前: 直连"
+      say "当前: $(hy 直连)"
     fi
     say ""
     say "  1) 添加出口"
@@ -1628,23 +2325,56 @@ menu() {
     say "  4) 查看状态 / 检测出口 IP"
     say "  5) 查看所有出口"
     say "  6) 删除出口"
-    say "  7) 本机信息（小鸡/母鸡、系统、配置）"
-    say "  8) 卸载"
-    say "  0) 退出"
-    ask in_menu "请选择" 0
-    case $in_menu in
+    say "  0) 返回"
+    ask in_menu1 "请选择" 0
+    case $in_menu1 in
       1) add_profile ;;
       2) pick_profile && use_profile "$PICKED" ;;
       3) turn_off ;;
       4) show_status ;;
       5) show_list ;;
       6) pick_profile && confirm "确定删除 $PICKED 吗？" n && del_profile "$PICKED" ;;
-      7) print_machine ;;
-      8) confirm "确定卸载吗？所有出口配置都会删掉" n && { uninstall; exit 0; } ;;
+      0|q) return 0 ;;
+      *) err "请输入菜单里的数字。" ;;
+    esac
+  done
+}
+
+menu() {
+  while :; do
+    title "vps-geo v$GEO_VERSION"
+    a=$(active_name)
+    if [ -n "$a" ] && load_profile "$a"; then
+      say "整机出口: $(hg "$a")（$(mode_text "$MODE" "$PORT")）"
+    else
+      say "整机出口: $(hy 直连)"
+    fi
+    say "节点出口: $(hg "$(nx_exit_count) 个出口")，$(hg "$(cut -f1,2 "$BINDS" 2>/dev/null | grep -c .) 个节点")单独设置了出口"
+    say ""
+    say "  $(hm 1)) 整机出口切换 —— 一键把整台机器换成某个出口 IP（geous / geooff）"
+    say "  $(hm 2)) 节点出口分流 —— 检测本机节点，给每个节点填自己的出口 IP"
+    say "  $(hm 3)) 节点管理 / 出口管理 —— 查看、检测、添加、修改、删除"
+    say "  4) 本机信息（小鸡/母鸡、系统、配置）"
+    say "  5) 更新脚本"
+    say "  9) 卸载"
+    say "  0) 退出"
+    ask in_menu "请选择" 0
+    case $in_menu in
+      1) menu_exit ;;
+      2) nx_assign ;;
+      3) nx_manage ;;
+      4) print_machine ;;
+      5) do_update ;;
+      9) confirm "确定卸载吗？所有出口配置都会删掉，节点恢复原来的出站" n && { uninstall; exit 0; } ;;
       0|q|exit) exit 0 ;;
       *) err "请输入菜单里的数字。" ;;
     esac
   done
+}
+
+do_update() {
+  download "$REPO_RAW/install.sh" "$SELF.new" && chmod 755 "$SELF.new" &&
+    mv "$SELF.new" "$SELF" && ok "已更新到最新版，重新输入 geo 打开。"
 }
 
 first_install() {
@@ -1668,10 +2398,11 @@ first_install() {
   if [ -z "$(active_name)" ] && check_ip; then save_real_ip; fi
   if [ -n "$(list_profiles)" ]; then
     migrate_profiles
-    menu
-  else
+  elif [ -n "${GEO_ASK_in_proxy:-}" ]; then
     add_profile
+    return 0
   fi
+  menu
 }
 
 # ---------------------------------------------------------------- entry
@@ -1709,12 +2440,18 @@ main() {
       cat <<EOF
 用法:
   geo              打开菜单
-  geo add          添加出口
+  geo add          添加整机出口
   geo <名字>       切换到某个出口（也可以直接输入名字，如 geous）
   geo off          关闭出口（同 geooff）
   geo status       查看当前出口 IP
   geo list         列出所有出口
   geo del <名字>   删除出口
+  geo node         节点出口分流：给每个节点填出口 IP（菜单 2）
+  geo manage       节点管理 / 出口管理（菜单 3）
+  geo nodes        列出本机节点和它们的出口
+  geo exits        列出节点出口
+  geo exit-add '<socks5://用户:密码@主机:端口#名字>'   添加节点出口
+  geo exit-test    检测全部节点出口
   geo info         本机信息（小鸡/母鸡检测）
   geo update       更新脚本
   geo uninstall    卸载
@@ -1734,8 +2471,14 @@ EOF
     list|ls) show_list ;;
     del|rm) [ -n "${1:-}" ] || die "用法: geo del <名字>"; del_profile "$1" ;;
     info) print_machine ;;
-    update) download "$REPO_RAW/install.sh" "$SELF.new" && chmod 755 "$SELF.new" &&
-              mv "$SELF.new" "$SELF" && ok "已更新到最新版。" ;;
+    node|bind) nx_assign ;;
+    manage) nx_manage ;;
+    nodes) nx_scan; nx_show_nodes ;;
+    exits) nx_show_exits ;;
+    exit-add) [ -n "${1:-}" ] || die "用法: geo exit-add 'socks5://用户:密码@主机:端口#名字'"
+              for _x in "$@"; do nx_exit_add_line "$_x"; done ;;
+    exit-test) nx_test_exits ;;
+    update) do_update ;;
     uninstall) confirm "确定卸载吗？" n && uninstall ;;
     *)
       if [ -f "$PROFILES/$cmd.conf" ]; then

@@ -1,6 +1,12 @@
-# VPS 出口 IP 一键切换
+# VPS 出口 IP 一键切换 + 节点出口分流
 
-粘贴一条 SOCKS5，起一个自己喜欢的命令名（比如 `geous`），以后在终端输入 `geous` 就换到这个出口 IP，输入 `geooff` 恢复本机 IP。
+输入 `geo` 打开主菜单，三大功能：
+
+| 菜单 | 功能 |
+| --- | --- |
+| **1) 整机出口切换** | 粘贴一条 SOCKS5，起一个命令名（比如 `geous`），以后输入 `geous` 整台机器就换到这个出口 IP，`geooff` 恢复本机 IP |
+| **2) 节点出口分流** | 自动检测本机所有节点（xray / sing-box / hysteria2 的每个入站），**给每个节点单独填出口 IP** |
+| **3) 节点管理 / 出口管理** | 查看节点和出口、检测出口是否可用、添加 / 修改 / 删除出口、去掉节点出口、手动添加节点配置 |
 
 - 自动检测：**小鸡还是母鸡**（KVM / Xen / VMware / OpenVZ / LXC / Docker / 物理机），以及系统、架构、CPU、内存、硬盘、IPv6
 - 兼容 Alpine、Debian、Ubuntu、CentOS / Rocky / Alma、Arch，x86_64 / ARM 都可以
@@ -20,7 +26,7 @@ wget -qO install.sh https://raw.githubusercontent.com/imthnio/vps-geo/main/insta
 GEO_GH_PROXY=https://ghfast.top/ sh install.sh
 ```
 
-## 运行后会问三件事
+## 菜单 1 添加整机出口时会问三件事
 
 ```
 第 1 步：填写 SOCKS5
@@ -48,7 +54,38 @@ SOCKS5 的写法这几种都认：
 
 快捷命令会按代理的国家自动给一个默认名（美国就是 `geous`），直接回车就行。
 
-## 两种模式怎么选
+## 2) 节点出口分流
+
+一台机器上搭了很多节点，想让 **每个节点从不同的出口 IP 出去**，就用这个。出口这样写，`#` 后面是出口的名字：
+
+```
+socks5://user-nl:globe-server-nl@10.91.0.1:8080#user-nl
+socks5://user-de:globe-server-de@10.91.0.1:8080#user-de
+```
+
+```
+==== 节点出口分流：给每个节点填出口 IP ====
+  [xray]  /usr/local/etc/xray/config.json  [运行中]
+    1) vless        端口 443    标签 vless-in    出口: 默认出站
+    2) vmess        端口 8443   标签 vmess-in    出口: → user-nl  socks5://user-nl:****@10.91.0.1:8080
+  [sing-box]  /etc/sing-box/config.json  [运行中]
+    3) hysteria2    端口 2054   标签 hy2-in      出口: 默认出站
+
+选节点: 输入序号，多个用空格隔开（如 1 3 或 2-5），a = 全部
+选择节点: 1 3
+填出口: 输入已有出口的序号或名字，或者直接粘贴新的出口
+出口: socks5://user-de:globe-server-de@10.91.0.1:8080#user-de
+```
+
+- 节点找法和整机模式的「节点接管」一样：直接找正在运行的 xray / v2ray / sing-box / hysteria 进程读出配置文件，也会看常见位置；都找不到时可以在菜单 3 里手动填配置路径
+- xray / sing-box 按 **入站** 分：一个配置文件里有多个入站，每个都可以填不同的出口；hysteria2（官方版）一个配置就是一个节点
+- 脚本在节点配置里加一个 socks 出站 `geo-x-<名字>` 和一条路由规则（这些入站 → 这个出口），规则放在原有的广告 / 内网屏蔽规则后面、其它规则前面。没有标签的入站会自动补一个 `geo-in-<端口>` 标签
+- 改完先用节点程序自检，不通过就自动还原；通过就重启节点。第一次修改前的原配置备份在 `/etc/geo/backup-x/`
+- 修改出口地址后，用到它的节点自动更新；删除出口或卸载 geo 时，节点自动恢复原来的出站
+- 和菜单 1 可以同时用：设置了出口的节点走自己的出口，其余节点和本机走菜单 1 的整机出口
+- x-ui / 3x-ui 等面板会自己重写配置，这里不改，请在面板里添加 socks 出站和路由规则
+
+## 1) 整机出口：两种模式怎么选
 
 不懂就选 **1 整机**，剩下的脚本自己判断。
 
@@ -85,11 +122,17 @@ curl -x socks5h://127.0.0.1:1080 ipinfo.io
 | --- | --- |
 | `geous`（你自己起的名字） | 切换到这个出口 |
 | `geooff` | 关闭，恢复本机 IP |
-| `geo` | 打开菜单：添加 / 切换 / 删除 / 查看 / 卸载 |
+| `geo` | 打开主菜单 |
 | `geo status` | 查看当前出口 IP |
 | `geo list` | 列出所有出口 |
 | `geo add` | 再添加一个出口（比如 `geojp`） |
 | `geo del geous` | 删除一个出口 |
+| `geo node` | 节点出口分流（菜单 2） |
+| `geo manage` | 节点管理 / 出口管理（菜单 3） |
+| `geo nodes` | 列出本机节点和它们的出口 |
+| `geo exits` | 列出节点出口 |
+| `geo exit-add 'socks5://用户:密码@主机:端口#名字'` | 添加节点出口（可一次给多个） |
+| `geo exit-test` | 检测全部节点出口的 IP / 国家 / 是否可用 |
 | `geo info` | 本机信息（小鸡 / 母鸡检测） |
 | `geo update` | 更新脚本 |
 | `geo uninstall` | 卸载 |
@@ -104,6 +147,9 @@ curl -x socks5h://127.0.0.1:1080 ipinfo.io
 | `/usr/local/bin/geo-glider` | 代理核心 [glider](https://github.com/nadoo/glider) |
 | `/etc/geo/profiles/*.conf` | 每个出口的配置（只有 root 能读） |
 | `/etc/geo/glider.conf` | 当前生效的代理配置 |
+| `/etc/geo/exits` | 节点出口列表（只有 root 能读） |
+| `/etc/geo/binds` | 哪个节点用哪个出口 |
+| `/etc/geo/backup-x/` | 节点配置第一次被修改前的备份 |
 
 代理程序以单独的 `geo` 用户运行。整机模式用 iptables 的 `GEO_OUT` 链，`geooff` 或卸载时会全部删掉。
 
